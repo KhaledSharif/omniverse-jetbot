@@ -159,8 +159,8 @@ class TestObservationBuilder:
         assert obs[0] == 1.0  # x
         assert obs[1] == 2.0  # y
         assert obs[2] == 0.5  # heading
-        assert obs[3] == 0.2  # linear vel
-        assert obs[4] == 0.1  # angular vel
+        assert np.isclose(obs[3], 0.2)  # linear vel
+        assert np.isclose(obs[4], 0.1)  # angular vel
         assert obs[5] == 3.0  # goal x
         assert obs[6] == 4.0  # goal y
         assert obs[9] == 0.0  # goal not reached
