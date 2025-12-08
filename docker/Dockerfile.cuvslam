@@ -1,0 +1,41 @@
+# Dockerfile for NVIDIA cuVSLAM with Isaac Sim Jetbot
+#
+# This container runs cuVSLAM (visual SLAM) and communicates with
+# Isaac Sim running on the host via FastDDS.
+#
+# Build:
+#   docker build -f docker/Dockerfile.cuvslam -t jetbot-cuvslam:latest .
+#
+# Run:
+#   ./docker/run_cuvslam.sh
+
+ARG BASE_IMAGE=nvcr.io/nvidia/isaac/ros:x86_64-ros2_humble_f8edad8d48e9aa1b5b240c2374c55d60
+
+FROM ${BASE_IMAGE}
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ROS_DISTRO=humble
+
+# Install Isaac ROS Visual SLAM and dependencies
+# Accept repository metadata changes with --allow-releaseinfo-change
+RUN apt-get update --allow-releaseinfo-change && apt-get install -y \
+    ros-humble-isaac-ros-visual-slam \
+    ros-humble-isaac-ros-stereo-image-proc \
+    ros-humble-diagnostic-updater \
+    ros-humble-tf2-ros \
+    ros-humble-tf2-geometry-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create workspace
+WORKDIR /opt/ros/cuvslam_ws
+
+# Copy launch file
+COPY docker/cuvslam.launch.py /opt/ros/cuvslam_ws/cuvslam.launch.py
+
+# Set up entrypoint
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["ros2", "launch", "/opt/ros/cuvslam_ws/cuvslam.launch.py"]

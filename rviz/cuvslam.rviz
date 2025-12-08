@@ -1,0 +1,216 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /TF1
+        - /SLAM Landmarks1
+        - /SLAM Trajectory1
+      Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+
+Visualization Manager:
+  Class: ""
+  Displays:
+    # Grid (reference frame: map)
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Normal Cell Count: 0
+      Cell Size: 1
+      Color: 160; 160; 164
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: map
+
+    # TF Frames
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+      Marker Scale: 0.3
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Update Interval: 0
+
+    # Left Camera Image - BEST EFFORT QoS
+    - Class: rviz_default_plugins/Image
+      Name: Left Camera
+      Enabled: true
+      Topic:
+        Value: /camera/left/image_raw
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Normalize Range: true
+      Max Value: 1
+      Min Value: 0
+      Median window: 5
+
+    # Right Camera Image - BEST EFFORT QoS
+    - Class: rviz_default_plugins/Image
+      Name: Right Camera
+      Enabled: true
+      Topic:
+        Value: /camera/right/image_raw
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Normalize Range: true
+      Max Value: 1
+      Min Value: 0
+      Median window: 5
+
+    # cuVSLAM Landmarks (3D Map) - Green points
+    - Class: rviz_default_plugins/PointCloud2
+      Name: SLAM Landmarks
+      Enabled: true
+      Topic:
+        Value: /visual_slam/vis/landmarks_cloud
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Size (Pixels): 3
+      Size (m): 0.02
+      Style: Spheres
+      Color Transformer: FlatColor
+      Color: 0; 255; 0
+      Use Fixed Frame: true
+
+    # cuVSLAM Observations (current frame features) - Yellow points
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Observations
+      Enabled: true
+      Topic:
+        Value: /visual_slam/vis/observations_cloud
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Size (Pixels): 2
+      Size (m): 0.01
+      Style: Points
+      Color Transformer: FlatColor
+      Color: 255; 255; 0
+
+    # cuVSLAM Trajectory - Magenta path
+    - Class: rviz_default_plugins/Path
+      Name: SLAM Trajectory
+      Enabled: true
+      Topic:
+        Value: /visual_slam/tracking/slam_path
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 255; 0; 255
+      Line Style: Lines
+      Line Width: 0.02
+
+    # Visual Odometry Path - Cyan path
+    - Class: rviz_default_plugins/Path
+      Name: VO Path
+      Enabled: true
+      Topic:
+        Value: /visual_slam/tracking/vo_path
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 0; 255; 255
+      Line Style: Lines
+      Line Width: 0.01
+
+    # SLAM Odometry Pose - Orange arrow
+    - Class: rviz_default_plugins/Odometry
+      Name: SLAM Pose
+      Enabled: true
+      Topic:
+        Value: /visual_slam/tracking/odometry
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Position Tolerance: 0.1
+      Angle Tolerance: 0.1
+      Keep: 1
+      Shape:
+        Alpha: 1
+        Axes Length: 0.2
+        Axes Radius: 0.02
+        Color: 255; 100; 0
+        Head Length: 0.05
+        Head Radius: 0.02
+        Shaft Length: 0.15
+        Shaft Radius: 0.01
+        Value: Arrow
+
+    # Robot Odometry (from Isaac Sim) - Red arrow
+    - Class: rviz_default_plugins/Odometry
+      Name: Robot Odometry
+      Enabled: true
+      Topic:
+        Value: /jetbot/odom
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Position Tolerance: 0.1
+      Angle Tolerance: 0.1
+      Keep: 50
+      Shape:
+        Alpha: 0.5
+        Axes Length: 0.1
+        Axes Radius: 0.01
+        Color: 255; 25; 0
+        Head Length: 0.03
+        Head Radius: 0.01
+        Shaft Length: 0.1
+        Shaft Radius: 0.005
+        Value: Arrow
+
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic: /initialpose
+
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 5
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: 0.6
+      Target Frame: chassis
+      Yaw: 0.8
+
+Window Geometry:
+  Height: 1000
+  Width: 1600
+  X: 100
+  Y: 100
+  Displays:
+    collapsed: false
+  Left Camera:
+    collapsed: false
+  Right Camera:
+    collapsed: false

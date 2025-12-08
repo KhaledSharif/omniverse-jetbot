@@ -1,16 +1,17 @@
 # Isaac Sim Jetbot Keyboard Control
 
-Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recording and reinforcement learning training pipeline for NVIDIA Isaac Sim 5.0.0.
+Keyboard-controlled Jetbot mobile robot teleoperation with ROS2 integration, RViz visualization, demonstration recording, and reinforcement learning training for NVIDIA Isaac Sim 5.0.0.
 
 ## Features
 
-- **Keyboard Teleoperation**: Control the Jetbot using WASD keys
+- **Keyboard Teleoperation**: Control the Jetbot using WASD keys with Ctrl+K capture toggle
+- **ROS2 Integration**: Publishes camera, odometry, TF, and clock topics via Isaac Sim's internal ROS2 bridge
+- **RViz Visualization**: Pre-configured RViz setup with RGB/depth cameras, TF tree, odometry, and point cloud
 - **Rich Terminal UI**: Real-time robot state display with visual feedback
 - **Camera Streaming**: GStreamer H264 RTP UDP streaming from Jetbot camera
 - **Random Obstacles**: Configurable static obstacles for navigation challenge
 - **Demonstration Recording**: Record navigation trajectories for imitation learning
 - **RL Training Pipeline**: Train PPO agents with optional behavioral cloning warmstart
-- **Gymnasium Integration**: Standard RL environment compatible with Stable-Baselines3
 
 ## Requirements
 
@@ -47,16 +48,20 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 ./run.sh
 ```
 
+### With ROS2 Bridge (for RViz visualization)
+
+```bash
+# Terminal 1: Start Isaac Sim with ROS2 bridge
+./run_ros2.sh
+
+# Terminal 2: Start RViz (requires ROS2 Jazzy)
+./rviz/view_jetbot.sh
+```
+
 ### With Recording Enabled
 
 ```bash
 ./run.sh --enable-recording
-```
-
-### With Custom Obstacle Count
-
-```bash
-./run.sh --num-obstacles 10
 ```
 
 ### Train RL Agent
@@ -69,6 +74,7 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 
 | Key | Action |
 |-----|--------|
+| Ctrl+K | Toggle keyboard capture (must enable first) |
 | W | Move forward |
 | S | Move backward |
 | A | Turn left |
@@ -77,9 +83,9 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 | R | Reset robot position |
 | G | Spawn new goal |
 | C | Toggle camera viewer |
-| Esc | Exit |
+| Esc | Exit (always active) |
 
-### Recording Controls
+### Recording Controls (when enabled with `--enable-recording`)
 
 | Key | Action |
 |-----|--------|
@@ -93,97 +99,78 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 isaac-sim-jetbot-keyboard/
 ├── src/
 │   ├── jetbot_keyboard_control.py    # Main teleoperation app
-│   ├── camera_streamer.py            # Camera streaming module
+│   ├── ros2_bridge.py                # ROS2 OmniGraph bridge
+│   ├── camera_streamer.py            # GStreamer camera streaming
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment
 │   ├── train_rl.py                   # PPO training script
 │   ├── eval_policy.py                # Policy evaluation
 │   ├── train_bc.py                   # Behavioral cloning
 │   ├── replay.py                     # Demo playback
-│   ├── test_jetbot_keyboard_control.py
-│   └── test_jetbot_rl_env.py
+│   └── test_*.py                     # Test files
+├── rviz/
+│   ├── jetbot.rviz                   # RViz configuration
+│   └── view_jetbot.sh                # RViz launch script
 ├── demos/                            # Recorded demonstrations
 ├── models/                           # Trained models
 ├── runs/                             # TensorBoard logs
-├── run.sh                            # Isaac Sim Python launcher
-├── run_tests.sh                      # Test runner
-├── CLAUDE.md                         # AI assistant guidance
-└── README.md
+├── run.sh                            # Basic teleoperation launcher
+├── run_ros2.sh                       # ROS2-enabled launcher
+└── run_tests.sh                      # Test runner
+```
+
+## ROS2 Integration
+
+The ROS2 bridge uses Isaac Sim's internal ROS2 libraries via OmniGraph nodes (no system ROS2 sourcing needed for Isaac Sim).
+
+### Published Topics
+
+| Topic | Type | Description |
+|-------|------|-------------|
+| `/jetbot/camera/rgb/image_raw` | sensor_msgs/Image | RGB camera |
+| `/jetbot/camera/depth/image_raw` | sensor_msgs/Image | Depth camera |
+| `/jetbot/camera/camera_info` | sensor_msgs/CameraInfo | RGB camera intrinsics |
+| `/jetbot/camera/depth/camera_info` | sensor_msgs/CameraInfo | Depth camera intrinsics |
+| `/jetbot/odom` | nav_msgs/Odometry | Robot odometry |
+| `/tf` | tf2_msgs/TFMessage | Transform tree (world → chassis) |
+| `/clock` | rosgraph_msgs/Clock | Simulation clock |
+
+### RViz Prerequisites (ROS2 Jazzy)
+
+```bash
+sudo apt install -y ros-jazzy-rviz2 ros-jazzy-depth-image-proc
+```
+
+### Running with RViz
+
+```bash
+# Terminal 1: Isaac Sim (don't source system ROS2)
+./run_ros2.sh
+
+# Terminal 2: RViz (source system ROS2)
+./rviz/view_jetbot.sh
 ```
 
 ## Usage Examples
 
-### Teleoperation
-
 ```bash
-# Basic teleoperation (5 obstacles by default)
+# Teleoperation
 ./run.sh
+./run.sh --num-obstacles 10 --enable-recording
 
-# With custom obstacle count
-./run.sh --num-obstacles 10
+# ROS2 mode
+./run_ros2.sh
 
-# With recording enabled
-./run.sh --enable-recording
-
-# Disable camera streaming
-./run.sh --no-camera
-
-# Custom camera port
-./run.sh --camera-port 5601
-
-# Combine options
-./run.sh --enable-recording --num-obstacles 8 --demo-path demos/my_demo.npz
-```
-
-### Training
-
-```bash
-# Train PPO agent (headless for speed)
+# Training
 ./run.sh train_rl.py --headless --timesteps 500000
 
-# Train with behavioral cloning warmstart
-./run.sh train_rl.py --bc-warmstart demos/recording.npz --timesteps 1000000
-
-# Train BC model only
-./run.sh train_bc.py demos/recording.npz --epochs 100
-```
-
-### Evaluation
-
-```bash
-# Evaluate trained policy
+# Evaluation
 ./run.sh eval_policy.py models/ppo_jetbot.zip --episodes 100
 
-# Headless evaluation
-./run.sh eval_policy.py models/ppo_jetbot.zip --headless --episodes 100
-```
-
-### Demo Inspection
-
-```bash
-# Show demo statistics (no simulation needed)
+# Demo playback
 ./run.sh replay.py demos/recording.npz --info
 
-# Visual playback
-./run.sh replay.py demos/recording.npz
-
-# Replay specific episode
-./run.sh replay.py demos/recording.npz --episode 0
-
-# Replay successful episodes only
-./run.sh replay.py demos/recording.npz --successful
-```
-
-### Testing
-
-```bash
-# Run all tests
+# Tests
 ./run_tests.sh
-
-# Run with verbose output
-./run_tests.sh -v
-
-# Run specific test
-./run_tests.sh -k test_action_mapper
 ```
 
 ## Observation Space (10D)
@@ -229,35 +216,18 @@ tensorboard --logdir runs/
 
 ### Main Components
 
-- **JetbotKeyboardController**: Main application with keyboard input and Rich TUI
+- **JetbotKeyboardController**: Main app with keyboard input and Rich TUI
+- **ROS2Bridge**: OmniGraph-based ROS2 topic publishing
 - **JetbotNavigationEnv**: Gymnasium-compatible RL environment
-- **DifferentialController**: Converts velocity commands to wheel speeds
-- **SceneManager**: Manages goal markers, obstacles, and scene objects
-- **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations
-- **CameraStreamer**: GStreamer H264 RTP UDP camera streaming
-
-### Obstacle System
-
-The SceneManager randomly spawns static obstacles (FixedCuboid, FixedCylinder, FixedSphere, FixedCapsule) with:
-- **Configurable count**: Set via `--num-obstacles` parameter (default: 5)
-- **Random shapes**: Mix of boxes, cylinders, spheres, and capsules
-- **Random sizes**: Varied dimensions for each obstacle type
-- **Safe placement**: Maintains minimum distance from goal (0.5m) and robot start (1.0m)
-- **Automatic respawn**: Obstacles regenerate when goal is reset (pressing 'G' or new episode)
-- **Varied colors**: Gray, brown, and blue-gray tones to contrast with orange goal marker
+- **SceneManager**: Goal markers and obstacle spawning
+- **CameraStreamer**: GStreamer H264 RTP UDP streaming
 
 ### Isaac Sim Integration
 
-The project uses Isaac Sim's:
-- `WheeledRobot` class for the Jetbot
-- `DifferentialController` for wheel velocity control
-- `World` for simulation management
+- `WheeledRobot` and `DifferentialController` for Jetbot control
+- OmniGraph nodes for ROS2 bridge (camera, TF, odometry, clock)
+- SimulationApp must be instantiated before any Isaac imports
 
 ## License
 
 MIT License
-
-## Acknowledgments
-
-- NVIDIA Isaac Sim team
-- Based on the [isaac-sim-franka-keyboard](https://github.com/example/isaac-sim-franka-keyboard) project structure
