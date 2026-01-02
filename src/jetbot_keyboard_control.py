@@ -9,11 +9,7 @@ This example demonstrates:
 - Demonstration recording for imitation learning
 
 Controls:
-    Keyboard Capture:
-        Ctrl+K: Toggle keyboard capture on/off
-                (Only captures keys when enabled - use when Isaac Sim window is focused)
-
-    Movement (requires keyboard capture enabled):
+    Movement:
         W: Move forward
         S: Move backward
         A: Turn left
@@ -28,7 +24,7 @@ Controls:
     System:
         R: Reset robot to start position
         G: Spawn new random goal
-        Esc: Exit application (always works)
+        Esc: Exit application
 """
 
 from isaacsim import SimulationApp
@@ -55,10 +51,6 @@ get_assets_root_path = None
 # Camera streaming (optional - graceful fallback if unavailable)
 CameraStreamer = None
 CAMERA_STREAMING_AVAILABLE = False
-
-# ROS2 Bridge (optional - graceful fallback if unavailable)
-ROS2Bridge = None
-ROS2_BRIDGE_AVAILABLE = False
 
 from rich.live import Live
 from rich.layout import Layout
@@ -93,13 +85,6 @@ class TUIRenderer:  # pragma: no cover
         # Camera streaming status
         self.streaming_active = False
         self.camera_enabled = False
-
-        # Keyboard capture status
-        self.keyboard_capture_enabled = False
-
-    def set_keyboard_capture_enabled(self, enabled: bool):  # pragma: no cover
-        """Set keyboard capture mode."""
-        self.keyboard_capture_enabled = enabled
 
     def set_pressed_key(self, key):  # pragma: no cover
         """Mark a key as pressed for highlighting."""
@@ -337,16 +322,8 @@ class TUIRenderer:  # pragma: no cover
         # Create main layout
         layout = Layout()
 
-        # Mode header with keyboard capture status
-        if self.keyboard_capture_enabled:
-            capture_status = Text(" [KEYBOARD ACTIVE] ", style="bold black on green")
-        else:
-            capture_status = Text(" [Ctrl+K to enable keyboard] ", style="bold black on yellow")
-        mode_text = Text.assemble(
-            Text("JETBOT NAVIGATION", style="bold white on blue"),
-            " ",
-            capture_status
-        )
+        # Mode header
+        mode_text = Text("JETBOT NAVIGATION", style="bold white on blue", justify="center")
 
         # Split into rows: header + content
         layout.split_column(
@@ -1108,8 +1085,7 @@ class JetbotKeyboardController:
 
     def __init__(self, enable_recording: bool = False, demo_path: str = None,
                  reward_mode: str = "dense", num_obstacles: int = 5,
-                 enable_camera: bool = True, camera_port: int = 5600,
-                 enable_ros2: bool = False):
+                 enable_camera: bool = True, camera_port: int = 5600):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -1119,13 +1095,11 @@ class JetbotKeyboardController:
             num_obstacles: Number of obstacles to spawn (default: 5)
             enable_camera: Enable camera streaming mode (default: True)
             camera_port: UDP port for camera stream (default: 5600)
-            enable_ros2: Enable ROS2 bridge for sensor publishing (default: False)
         """
         # Create SimulationApp if not already created (e.g., by tests)
         global simulation_app, World, ArticulationAction, WheeledRobot
         global DifferentialController, get_assets_root_path
         global CameraStreamer, CAMERA_STREAMING_AVAILABLE
-        global ROS2Bridge, ROS2_BRIDGE_AVAILABLE
 
         if simulation_app is None:
             simulation_app = SimulationApp({"headless": False})
@@ -1199,10 +1173,6 @@ class JetbotKeyboardController:
         self.command_lock = threading.Lock()
         self.pending_commands = []
 
-        # Keyboard capture mode (Ctrl+K to toggle)
-        self.keyboard_capture_enabled = False
-        self.ctrl_pressed = False
-
         # Recording configuration
         self.enable_recording = enable_recording
         self.reward_mode = reward_mode
@@ -1235,10 +1205,6 @@ class JetbotKeyboardController:
         if self.enable_recording:
             self._init_recording_components()
 
-        # ROS2 bridge configuration
-        self.enable_ros2 = enable_ros2
-        self.ros2_bridge = None
-
         # Camera streaming configuration
         self.enable_camera = enable_camera and CAMERA_STREAMING_AVAILABLE
         self.camera_port = camera_port
@@ -1259,8 +1225,6 @@ class JetbotKeyboardController:
             init_msg += " [RECORDING]"
         if self.enable_camera:
             init_msg += " [CAMERA]"
-        if self.enable_ros2:
-            init_msg += " [ROS2]"
         self.tui.set_last_command(init_msg)
 
     def _init_recording_components(self):
@@ -1306,43 +1270,6 @@ class JetbotKeyboardController:
             self.camera_streamer = None
             self.enable_camera = False
             self.tui.set_camera_enabled(False)
-
-    def _init_ros2_bridge(self):
-        """Initialize ROS2 bridge for publishing sensor data."""
-        global ROS2Bridge, ROS2_BRIDGE_AVAILABLE
-
-        if not self.enable_ros2:
-            return
-
-        # Try to import ROS2 bridge module
-        if ROS2Bridge is None:
-            try:
-                from ros2_bridge import ROS2Bridge as _ROS2Bridge
-                ROS2Bridge = _ROS2Bridge
-                ROS2_BRIDGE_AVAILABLE = True
-            except ImportError as e:
-                print(f"[Warning] ROS2 bridge not available: {e}")
-                ROS2_BRIDGE_AVAILABLE = False
-                self.enable_ros2 = False
-                return
-
-        try:
-            self.ros2_bridge = ROS2Bridge(robot_prim_path="/World/Jetbot")
-
-            if self.ros2_bridge.create_ros2_graph():
-                topics = self.ros2_bridge.get_published_topics()
-                self.tui.set_last_command(f"ROS2 bridge: {len(topics)} topics")
-            else:
-                print("[Warning] ROS2 bridge graph creation failed")
-                self.ros2_bridge = None
-                self.enable_ros2 = False
-
-        except Exception as e:
-            print(f"[Warning] ROS2 bridge init failed: {e}")
-            import traceback
-            traceback.print_exc()
-            self.ros2_bridge = None
-            self.enable_ros2 = False
 
     def _toggle_camera_viewer(self):
         """Toggle camera viewer and streaming on/off."""
@@ -1452,26 +1379,6 @@ class JetbotKeyboardController:
     def _on_key_press(self, key):
         """Handle key press events from pynput."""
         try:
-            # Track Ctrl key state
-            if key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-                self.ctrl_pressed = True
-                return
-
-            # Handle Ctrl+K to toggle keyboard capture
-            if self.ctrl_pressed and hasattr(key, 'char') and key.char and key.char.lower() == 'k':
-                self.keyboard_capture_enabled = not self.keyboard_capture_enabled
-                self.tui.set_keyboard_capture_enabled(self.keyboard_capture_enabled)
-                status = "ENABLED" if self.keyboard_capture_enabled else "DISABLED"
-                self.tui.set_last_command(f"Keyboard capture {status}")
-                return
-
-            # Ignore other keys if capture is disabled (except Esc for safety)
-            if not self.keyboard_capture_enabled:
-                if key == keyboard.Key.esc:
-                    self.tui.set_pressed_key('esc')
-                    self._queue_command(('special', 'esc'))
-                return
-
             # Handle character keys
             if hasattr(key, 'char') and key.char:
                 key_char = key.char.lower()
@@ -1490,11 +1397,6 @@ class JetbotKeyboardController:
     def _on_key_release(self, key):
         """Handle key release events from pynput."""
         try:
-            # Track Ctrl key release
-            if key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-                self.ctrl_pressed = False
-                return
-
             if hasattr(key, 'char') and key.char:
                 self.tui.clear_pressed_key(key.char.lower())
             elif key == keyboard.Key.space:
@@ -1702,10 +1604,6 @@ class JetbotKeyboardController:
             if self.camera_streamer is not None:
                 self.camera_streamer.initialize()
 
-        # Initialize ROS2 bridge after world reset (OmniGraph needs world to be ready)
-        if self.enable_ros2:
-            self._init_ros2_bridge()
-
         # Build initial observation if recording enabled
         if self.enable_recording:
             self.current_obs = self._build_current_observation()
@@ -1718,8 +1616,6 @@ class JetbotKeyboardController:
             ready_msg += " | C=Camera"
         if self.enable_recording:
             ready_msg += " | `=Record"
-        if self.enable_ros2 and self.ros2_bridge is not None:
-            ready_msg += " | ROS2"
         self.tui.set_last_command(ready_msg)
 
         # Disable terminal echo
@@ -1833,10 +1729,6 @@ def parse_args():
         '--camera-port', type=int, default=5600,
         help='UDP port for camera stream (default: 5600)'
     )
-    parser.add_argument(
-        '--enable-ros2', action='store_true',
-        help='Enable ROS2 bridge for sensor publishing'
-    )
     return parser.parse_args()
 
 
@@ -1848,7 +1740,6 @@ if __name__ == "__main__":
         reward_mode=args.reward_mode,
         num_obstacles=args.num_obstacles,
         enable_camera=not args.no_camera,
-        camera_port=args.camera_port,
-        enable_ros2=args.enable_ros2
+        camera_port=args.camera_port
     )
     controller.run()
