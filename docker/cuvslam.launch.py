@@ -119,12 +119,12 @@ def generate_launch_description():
 
     # Static transform: chassis -> left_camera
     # Position: stereo_mount (0.07, 0, 0.06) + left offset (0, 0.05, 0) = (0.07, 0.05, 0.06)
-    # Rotation: XYZ Euler (90, 0, -90) = quaternion (0.5, -0.5, -0.5, 0.5)
+    # Rotation: XYZ Euler (0, -90, -90) = quaternion (-0.5, -0.5, -0.5, 0.5)
     chassis_to_left_camera_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='chassis_to_left_camera_tf',
-        arguments=['0.07', '0.05', '0.06', '0.5', '-0.5', '-0.5', '0.5', 'chassis', 'left_camera'],
+        arguments=['0.07', '0.05', '0.06', '-0.5', '-0.5', '-0.5', '0.5', 'chassis', 'left_camera'],
         parameters=[{
             'use_sim_time': LaunchConfiguration('use_sim_time'),
         }]
@@ -132,12 +132,12 @@ def generate_launch_description():
 
     # Static transform: chassis -> right_camera
     # Position: stereo_mount (0.07, 0, 0.06) + right offset (0, -0.05, 0) = (0.07, -0.05, 0.06)
-    # Rotation: XYZ Euler (90, 0, -90) = quaternion (0.5, -0.5, -0.5, 0.5)
+    # Rotation: same as left camera
     chassis_to_right_camera_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='chassis_to_right_camera_tf',
-        arguments=['0.07', '-0.05', '0.06', '0.5', '-0.5', '-0.5', '0.5', 'chassis', 'right_camera'],
+        arguments=['0.07', '-0.05', '0.06', '-0.5', '-0.5', '-0.5', '0.5', 'chassis', 'right_camera'],
         parameters=[{
             'use_sim_time': LaunchConfiguration('use_sim_time'),
         }]
