@@ -38,6 +38,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **ObservationBuilder**: Builds observation vectors from robot state
 - **RewardComputer**: Computes navigation rewards
 - **CameraStreamer**: GStreamer H264 RTP UDP camera streaming (`src/camera_streamer.py`)
+- **LidarSensor**: Analytical 2D raycasting for obstacle detection (no physics dependency)
 - **AutoPilot**: Noisy proportional controller for autonomous demo collection
 
 ## Keyboard Controls
@@ -66,17 +67,21 @@ System:
 
 ## State & Action Spaces
 
-### Observation Space (10D)
+### Observation Space (34D for RL env, 10D base for keyboard control)
 ```
-[0:2]  - Robot position (x, y)
-[2]    - Robot heading (theta)
-[3]    - Linear velocity
-[4]    - Angular velocity
-[5:7]  - Goal position (x, y)
-[7]    - Distance to goal
-[8]    - Angle to goal
-[9]    - Goal reached flag
+[0:2]   - Robot position (x, y)
+[2]     - Robot heading (theta)
+[3]     - Linear velocity
+[4]     - Angular velocity
+[5:7]   - Goal position (x, y)
+[7]     - Distance to goal
+[8]     - Angle to goal
+[9]     - Goal reached flag
+[10:34] - LiDAR: 24 normalized distances (0=touching, 1=max range), 180° FOV
 ```
+
+The RL environment (`JetbotNavigationEnv`) always uses 34D observations with LiDAR.
+The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 
 ### Action Space (2D)
 ```
@@ -110,6 +115,9 @@ System:
 
 # Headless TUI (console progress prints)
 ./run.sh --enable-recording --automatic --num-episodes 200 --headless-tui
+
+# Collect 34D demos with LiDAR observations
+./run.sh --enable-recording --automatic --use-lidar
 
 # Training
 ./run.sh train_rl.py --headless --timesteps 500000

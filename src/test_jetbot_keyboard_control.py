@@ -136,10 +136,57 @@ class TestObservationBuilder:
     """Tests for ObservationBuilder class."""
 
     def test_observation_builder_initialization(self):
-        """Test ObservationBuilder initializes with correct dimensions."""
+        """Test ObservationBuilder initializes with correct dimensions (no lidar)."""
         from jetbot_keyboard_control import ObservationBuilder
         builder = ObservationBuilder()
         assert builder.obs_dim == 10
+
+    def test_observation_builder_with_lidar(self):
+        """Test ObservationBuilder initializes with 34D when lidar provided."""
+        from jetbot_keyboard_control import ObservationBuilder, LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+        builder = ObservationBuilder(lidar_sensor=lidar)
+        assert builder.obs_dim == 34
+
+    def test_build_observation_34d_with_lidar(self):
+        """Test building 34D observation with lidar."""
+        from jetbot_keyboard_control import ObservationBuilder, LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+        builder = ObservationBuilder(lidar_sensor=lidar)
+
+        obs = builder.build(
+            robot_position=np.array([0.0, 0.0, 0.0]),
+            robot_heading=0.0,
+            linear_velocity=0.0,
+            angular_velocity=0.0,
+            goal_position=np.array([1.0, 1.0, 0.0]),
+            goal_reached=False,
+            obstacle_metadata=[],
+            workspace_bounds={'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+        )
+
+        assert obs.shape == (34,)
+        assert obs.dtype == np.float32
+        # LiDAR readings should be normalized [0, 1]
+        assert np.all(obs[10:] >= 0.0)
+        assert np.all(obs[10:] <= 1.0)
+
+    def test_build_observation_10d_without_lidar_params(self):
+        """Test that 10D obs is returned when lidar is set but no metadata passed."""
+        from jetbot_keyboard_control import ObservationBuilder, LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+        builder = ObservationBuilder(lidar_sensor=lidar)
+
+        obs = builder.build(
+            robot_position=np.array([0.0, 0.0, 0.0]),
+            robot_heading=0.0,
+            linear_velocity=0.0,
+            angular_velocity=0.0,
+            goal_position=np.array([1.0, 1.0, 0.0]),
+            goal_reached=False,
+        )
+        # Without obstacle_metadata/workspace_bounds, falls back to base obs
+        assert obs.shape == (10,)
 
     def test_build_observation_basic(self):
         """Test building observation with basic inputs."""
@@ -283,6 +330,236 @@ class TestRewardComputer:
 
         # Should get positive reward for getting closer
         assert reward > 0
+
+    def test_reward_computer_collision_penalty(self):
+        """Test collision returns -10 penalty."""
+        from jetbot_keyboard_control import RewardComputer
+        computer = RewardComputer(mode='dense')
+
+        reward = computer.compute(
+            obs=np.zeros(10),
+            action=np.zeros(2),
+            next_obs=np.zeros(10),
+            info={'goal_reached': False, 'collision': True}
+        )
+        assert reward == RewardComputer.COLLISION_PENALTY
+
+    def test_reward_computer_sparse_collision_penalty(self):
+        """Test sparse mode also returns collision penalty."""
+        from jetbot_keyboard_control import RewardComputer
+        computer = RewardComputer(mode='sparse')
+
+        reward = computer.compute(
+            obs=np.zeros(10),
+            action=np.zeros(2),
+            next_obs=np.zeros(10),
+            info={'goal_reached': False, 'collision': True}
+        )
+        assert reward == RewardComputer.COLLISION_PENALTY
+
+    def test_reward_computer_proximity_penalty(self):
+        """Test proximity penalty when close to obstacle."""
+        from jetbot_keyboard_control import RewardComputer
+        computer = RewardComputer(mode='dense')
+
+        prev_obs = np.zeros(10)
+        prev_obs[7] = 2.0
+        next_obs = np.zeros(10)
+        next_obs[7] = 2.0
+        next_obs[8] = 0.0
+
+        # Close to obstacle (min_lidar < threshold)
+        reward_close = computer.compute(
+            obs=prev_obs, action=np.zeros(2), next_obs=next_obs,
+            info={'goal_reached': False, 'min_lidar_distance': 0.1}
+        )
+
+        # Far from obstacles
+        reward_far = computer.compute(
+            obs=prev_obs, action=np.zeros(2), next_obs=next_obs,
+            info={'goal_reached': False, 'min_lidar_distance': 1.0}
+        )
+
+        assert reward_close < reward_far, "Proximity penalty should reduce reward"
+
+    def test_reward_computer_no_proximity_penalty_when_far(self):
+        """Test no proximity penalty when far from obstacles."""
+        from jetbot_keyboard_control import RewardComputer
+        computer = RewardComputer(mode='dense')
+
+        prev_obs = np.zeros(10)
+        prev_obs[7] = 2.0
+        next_obs = np.zeros(10)
+        next_obs[7] = 2.0
+        next_obs[8] = 0.0
+
+        reward_no_lidar = computer.compute(
+            obs=prev_obs, action=np.zeros(2), next_obs=next_obs,
+            info={'goal_reached': False}
+        )
+        reward_far_lidar = computer.compute(
+            obs=prev_obs, action=np.zeros(2), next_obs=next_obs,
+            info={'goal_reached': False, 'min_lidar_distance': 2.0}
+        )
+
+        # Only difference should be time penalty (present in both)
+        assert abs(reward_no_lidar - reward_far_lidar) < 0.001
+
+
+# ============================================================================
+# TEST SUITE: LidarSensor
+# ============================================================================
+
+class TestLidarSensor:
+    """Tests for LidarSensor class."""
+
+    def test_initialization(self):
+        """Test LidarSensor initializes correctly."""
+        from jetbot_keyboard_control import LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+        assert lidar.num_rays == 24
+        assert lidar.fov_deg == 180.0
+        assert lidar.max_range == 3.0
+
+    def test_output_shape_and_dtype(self):
+        """Test scan returns correct shape and dtype."""
+        from jetbot_keyboard_control import LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+
+        result = lidar.scan(
+            robot_position_2d=np.array([0.0, 0.0]),
+            robot_heading=0.0,
+            obstacle_metadata=[],
+            workspace_bounds={'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+        )
+
+        assert result.shape == (24,)
+        assert result.dtype == np.float32
+
+    def test_no_obstacles_returns_wall_or_max_range(self):
+        """Test that with no obstacles, rays hit walls or return max_range."""
+        from jetbot_keyboard_control import LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+
+        result = lidar.scan(
+            robot_position_2d=np.array([0.0, 0.0]),
+            robot_heading=0.0,
+            obstacle_metadata=[],
+            workspace_bounds={'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+        )
+
+        # All distances should be positive and <= max_range
+        assert np.all(result > 0)
+        assert np.all(result <= 3.0)
+
+    def test_obstacle_directly_ahead(self):
+        """Test obstacle directly ahead is detected by center ray."""
+        from jetbot_keyboard_control import LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+
+        # Place obstacle at (1.0, 0.0) with radius 0.1
+        # Robot at origin facing +x
+        result = lidar.scan(
+            robot_position_2d=np.array([0.0, 0.0]),
+            robot_heading=0.0,
+            obstacle_metadata=[(np.array([1.0, 0.0]), 0.1)],
+            workspace_bounds={'x': [-5.0, 5.0], 'y': [-5.0, 5.0]}
+        )
+
+        # Center ray (index 12 for 24 rays, or close to it) should detect obstacle
+        # The center ray should hit at distance ~0.9 (1.0 - radius)
+        center_idx = lidar.num_rays // 2
+        assert result[center_idx] < 1.5, "Center ray should detect nearby obstacle"
+
+    def test_obstacle_to_the_left(self):
+        """Test obstacle to the left is detected by left-side rays."""
+        from jetbot_keyboard_control import LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+
+        # Robot at origin facing +x, obstacle at (0, 1) (left side)
+        result = lidar.scan(
+            robot_position_2d=np.array([0.0, 0.0]),
+            robot_heading=0.0,
+            obstacle_metadata=[(np.array([0.0, 1.0]), 0.1)],
+            workspace_bounds={'x': [-5.0, 5.0], 'y': [-5.0, 5.0]}
+        )
+
+        # Left rays (high indices, positive angle offset) should detect
+        # Right rays (low indices) should not
+        left_min = result[18:].min()
+        right_min = result[:6].min()
+        assert left_min < right_min, "Left rays should detect obstacle on the left"
+
+    def test_obstacle_behind_not_detected(self):
+        """Test obstacle behind robot (outside 180 FOV) is not detected."""
+        from jetbot_keyboard_control import LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+
+        # Robot at origin facing +x, obstacle at (-1.0, 0.0) - behind
+        result = lidar.scan(
+            robot_position_2d=np.array([0.0, 0.0]),
+            robot_heading=0.0,
+            obstacle_metadata=[(np.array([-1.0, 0.0]), 0.1)],
+            workspace_bounds={'x': [-5.0, 5.0], 'y': [-5.0, 5.0]}
+        )
+
+        # No ray should detect the obstacle behind (all hit walls far away)
+        # With large workspace, all rays should be > 2.0
+        assert np.all(result > 1.5), "Obstacle behind should not be detected"
+
+    def test_workspace_boundary_detection(self):
+        """Test rays hitting workspace walls."""
+        from jetbot_keyboard_control import LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=10.0)
+
+        # Robot at origin, walls at +/- 2.0
+        result = lidar.scan(
+            robot_position_2d=np.array([0.0, 0.0]),
+            robot_heading=0.0,
+            obstacle_metadata=[],
+            workspace_bounds={'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+        )
+
+        # Center ray (facing +x) should hit wall at x=2.0 -> distance=2.0
+        center_idx = lidar.num_rays // 2
+        assert abs(result[center_idx] - 2.0) < 0.01, "Center ray should hit wall at 2.0m"
+
+    def test_multiple_obstacles_nearest_wins(self):
+        """Test nearest obstacle per ray is reported."""
+        from jetbot_keyboard_control import LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=5.0)
+
+        # Two obstacles ahead, near and far
+        result = lidar.scan(
+            robot_position_2d=np.array([0.0, 0.0]),
+            robot_heading=0.0,
+            obstacle_metadata=[
+                (np.array([1.0, 0.0]), 0.1),  # Near
+                (np.array([3.0, 0.0]), 0.1),  # Far
+            ],
+            workspace_bounds={'x': [-5.0, 5.0], 'y': [-5.0, 5.0]}
+        )
+
+        center_idx = lidar.num_rays // 2
+        # Should detect near obstacle, not far one
+        assert result[center_idx] < 1.5, "Should detect nearest obstacle"
+
+    def test_ray_at_fov_boundary(self):
+        """Test rays at FOV boundary edges work correctly."""
+        from jetbot_keyboard_control import LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+
+        result = lidar.scan(
+            robot_position_2d=np.array([0.0, 0.0]),
+            robot_heading=0.0,
+            obstacle_metadata=[],
+            workspace_bounds={'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+        )
+
+        # First and last rays should be at +/- 90 degrees
+        # They should hit the y-walls at +/- 2.0
+        assert result[0] > 0, "First ray should detect something"
+        assert result[-1] > 0, "Last ray should detect something"
 
 
 # ============================================================================

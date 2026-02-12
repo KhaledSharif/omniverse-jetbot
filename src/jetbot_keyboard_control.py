@@ -405,6 +405,7 @@ class SceneManager:
         self.workspace_bounds = workspace_bounds or self.DEFAULT_WORKSPACE_BOUNDS.copy()
         self.goal_counter = 0
         self.obstacles = []
+        self.obstacle_metadata = []  # List of (position_2d, effective_radius) tuples
         self.obstacle_counter = 0
         self.num_obstacles = num_obstacles
 
@@ -505,6 +506,14 @@ class SceneManager:
 
         return distance < threshold
 
+    def get_obstacle_metadata(self) -> list:
+        """Get obstacle geometry metadata for LiDAR raycasting.
+
+        Returns:
+            List of (position_2d, effective_radius) tuples
+        """
+        return self.obstacle_metadata
+
     def clear_obstacles(self) -> None:
         """Clear all obstacles from the scene."""
         for obstacle in self.obstacles:
@@ -513,6 +522,7 @@ class SceneManager:
             except (AttributeError, Exception):
                 pass
         self.obstacles = []
+        self.obstacle_metadata = []
 
     def _generate_safe_position(self, min_distance_from_goal: float = 0.5,
                                 min_distance_from_start: float = 1.0) -> list:
@@ -587,6 +597,8 @@ class SceneManager:
                 color = colors[np.random.randint(0, len(colors))]
 
                 # Create obstacle based on shape type
+                pos_2d = np.array(position[:2], dtype=np.float32)
+
                 if shape_type == 'cuboid':
                     size = np.random.uniform(0.15, 0.3)
                     obstacle = self.world.scene.add(
@@ -598,6 +610,7 @@ class SceneManager:
                             color=color
                         )
                     )
+                    effective_radius = size * np.sqrt(2) / 2
                 elif shape_type == 'cylinder':
                     radius = np.random.uniform(0.08, 0.15)
                     height = np.random.uniform(0.2, 0.5)
@@ -611,6 +624,7 @@ class SceneManager:
                             color=color
                         )
                     )
+                    effective_radius = radius
                 elif shape_type == 'sphere':
                     radius = np.random.uniform(0.1, 0.2)
                     obstacle = self.world.scene.add(
@@ -622,6 +636,7 @@ class SceneManager:
                             color=color
                         )
                     )
+                    effective_radius = radius
                 else:  # capsule
                     radius = np.random.uniform(0.08, 0.12)
                     height = np.random.uniform(0.2, 0.4)
@@ -635,8 +650,10 @@ class SceneManager:
                             color=color
                         )
                     )
+                    effective_radius = radius
 
                 self.obstacles.append(obstacle)
+                self.obstacle_metadata.append((pos_2d, effective_radius))
 
         except ImportError:
             # Fall back to no obstacles for testing
@@ -910,7 +927,7 @@ class ActionMapper:
 class ObservationBuilder:
     """Builds observation vectors from robot state.
 
-    Observation layout (10D):
+    Observation layout (10D base, or 10+N with LiDAR):
         [0:2]  - robot position (x, y)
         [2]    - robot heading (theta)
         [3]    - linear velocity
@@ -919,15 +936,27 @@ class ObservationBuilder:
         [7]    - distance to goal
         [8]    - angle to goal (relative heading)
         [9]    - goal reached flag
+        [10:]  - (optional) normalized LiDAR distances
     """
 
-    def __init__(self):
-        """Initialize the ObservationBuilder."""
-        self.obs_dim = 10
+    def __init__(self, lidar_sensor: 'LidarSensor' = None):
+        """Initialize the ObservationBuilder.
+
+        Args:
+            lidar_sensor: Optional LidarSensor instance. When provided,
+                         observations include normalized LiDAR readings.
+        """
+        self.lidar_sensor = lidar_sensor
+        if lidar_sensor is not None:
+            self.obs_dim = 10 + lidar_sensor.num_rays
+        else:
+            self.obs_dim = 10
 
     def build(self, robot_position: np.ndarray, robot_heading: float,
               linear_velocity: float, angular_velocity: float,
-              goal_position: np.ndarray, goal_reached: bool) -> np.ndarray:
+              goal_position: np.ndarray, goal_reached: bool,
+              obstacle_metadata: list = None,
+              workspace_bounds: dict = None) -> np.ndarray:
         """Build an observation vector from robot state.
 
         Args:
@@ -937,9 +966,11 @@ class ObservationBuilder:
             angular_velocity: Current angular velocity (rad/s)
             goal_position: Goal [x, y] or [x, y, z] position
             goal_reached: Whether goal has been reached
+            obstacle_metadata: List of (center_2d, radius) tuples for LiDAR
+            workspace_bounds: Dict with 'x', 'y' bounds for LiDAR
 
         Returns:
-            10D observation vector as float32
+            Observation vector as float32 (10D without LiDAR, 10+N with LiDAR)
         """
         # Extract 2D positions
         robot_pos_2d = np.array(robot_position[:2], dtype=np.float32)
@@ -955,7 +986,7 @@ class ObservationBuilder:
         # Normalize to [-pi, pi]
         angle_to_goal = np.arctan2(np.sin(angle_to_goal), np.cos(angle_to_goal))
 
-        obs = np.array([
+        base_obs = np.array([
             robot_pos_2d[0],           # [0] x
             robot_pos_2d[1],           # [1] y
             robot_heading,             # [2] theta
@@ -968,19 +999,32 @@ class ObservationBuilder:
             1.0 if goal_reached else 0.0,  # [9] goal reached flag
         ], dtype=np.float32)
 
-        return obs
+        if self.lidar_sensor is not None and obstacle_metadata is not None and workspace_bounds is not None:
+            raw_distances = self.lidar_sensor.scan(
+                robot_pos_2d, robot_heading, obstacle_metadata, workspace_bounds
+            )
+            normalized_lidar = raw_distances / self.lidar_sensor.max_range
+            return np.concatenate([base_obs, normalized_lidar])
+
+        return base_obs
 
 
 class RewardComputer:
     """Computes rewards for navigation task.
 
-    Supports both sparse and dense reward modes.
+    Supports both sparse and dense reward modes. Includes collision
+    and proximity penalties when LiDAR information is available.
     """
 
     # Reward constants
     GOAL_REACHED_REWARD = 10.0
     DISTANCE_SCALE = 1.0
     HEADING_BONUS_SCALE = 0.1
+    COLLISION_PENALTY = -10.0
+    PROXIMITY_SCALE = 0.1
+    PROXIMITY_THRESHOLD = 0.3  # meters
+    TIME_PENALTY = -0.005
+    ROBOT_RADIUS = 0.08  # Jetbot effective radius
 
     def __init__(self, mode: str = 'dense'):
         """Initialize the RewardComputer.
@@ -998,7 +1042,8 @@ class RewardComputer:
             obs: Previous observation
             action: Action taken
             next_obs: Resulting observation
-            info: Additional info dict with flags like 'goal_reached'
+            info: Additional info dict with flags like 'goal_reached',
+                  'collision', 'min_lidar_distance'
 
         Returns:
             Scalar reward value
@@ -1009,13 +1054,19 @@ class RewardComputer:
             return self._dense_reward(obs, next_obs, info)
 
     def _sparse_reward(self, info: dict) -> float:
-        """Compute sparse reward (only on goal reached)."""
+        """Compute sparse reward (only on goal reached or collision)."""
+        if info.get('collision', False):
+            return self.COLLISION_PENALTY
         if info.get('goal_reached', False):
             return self.GOAL_REACHED_REWARD
         return 0.0
 
     def _dense_reward(self, obs: np.ndarray, next_obs: np.ndarray, info: dict) -> float:
         """Compute dense shaped reward."""
+        # Collision check (early return)
+        if info.get('collision', False):
+            return self.COLLISION_PENALTY
+
         reward = 0.0
 
         # Goal reached bonus
@@ -1032,6 +1083,15 @@ class RewardComputer:
         angle_to_goal = abs(next_obs[8])  # angle to goal
         heading_bonus = (np.pi - angle_to_goal) / np.pi  # 1.0 when facing goal, 0.0 when facing away
         reward += heading_bonus * self.HEADING_BONUS_SCALE
+
+        # Proximity penalty (smooth, increases as robot nears obstacle)
+        min_lidar = info.get('min_lidar_distance', float('inf'))
+        if min_lidar < self.PROXIMITY_THRESHOLD:
+            proximity_penalty = self.PROXIMITY_SCALE * (1.0 - min_lidar / self.PROXIMITY_THRESHOLD)
+            reward -= proximity_penalty
+
+        # Small time penalty to encourage efficiency
+        reward += self.TIME_PENALTY
 
         return reward
 
@@ -1086,6 +1146,121 @@ class AutoPilot:
         angular_vel = np.clip(angular_vel, -self.max_angular_vel, self.max_angular_vel)
 
         return float(linear_vel), float(angular_vel)
+
+
+class LidarSensor:
+    """Analytical 2D LiDAR sensor using raycasting against known geometry.
+
+    Computes ray-obstacle and ray-boundary intersection distances from
+    known obstacle positions and radii. No physics engine dependency.
+
+    Attributes:
+        num_rays: Number of LiDAR rays
+        fov_deg: Field of view in degrees
+        max_range: Maximum detection range in meters
+    """
+
+    def __init__(self, num_rays: int = 24, fov_deg: float = 180.0, max_range: float = 3.0):
+        """Initialize LiDAR sensor.
+
+        Args:
+            num_rays: Number of rays to cast
+            fov_deg: Field of view in degrees (centered on robot heading)
+            max_range: Maximum range in meters
+        """
+        self.num_rays = num_rays
+        self.fov_deg = fov_deg
+        self.max_range = max_range
+        self._fov_rad = np.radians(fov_deg)
+
+        # Precompute ray angle offsets relative to robot heading
+        # Evenly spaced from -fov/2 to +fov/2
+        self._ray_offsets = np.linspace(
+            -self._fov_rad / 2, self._fov_rad / 2, num_rays
+        )
+
+    def scan(self, robot_position_2d: np.ndarray, robot_heading: float,
+             obstacle_metadata: list, workspace_bounds: dict) -> np.ndarray:
+        """Perform a LiDAR scan.
+
+        Args:
+            robot_position_2d: Robot [x, y] position
+            robot_heading: Robot heading in radians
+            obstacle_metadata: List of (center_2d, radius) tuples
+            workspace_bounds: Dict with 'x' and 'y' keys, each [min, max]
+
+        Returns:
+            Array of shape (num_rays,) with distances in meters, clamped to [0, max_range]
+        """
+        distances = np.full(self.num_rays, self.max_range, dtype=np.float32)
+        ox, oy = robot_position_2d[0], robot_position_2d[1]
+
+        # Precompute ray directions
+        ray_angles = robot_heading + self._ray_offsets
+        dx = np.cos(ray_angles)
+        dy = np.sin(ray_angles)
+
+        # Check each ray against obstacles
+        if obstacle_metadata:
+            for center, radius in obstacle_metadata:
+                # Vector from ray origin to circle center
+                fx = ox - center[0]
+                fy = oy - center[1]
+
+                # Quadratic coefficients: a=1 (dx^2+dy^2 for unit dir)
+                # b = 2*(fx*dx + fy*dy), c = fx^2+fy^2 - r^2
+                b = 2.0 * (fx * dx + fy * dy)
+                c = fx * fx + fy * fy - radius * radius
+
+                discriminant = b * b - 4.0 * c
+                hit_mask = discriminant >= 0
+
+                if np.any(hit_mask):
+                    sqrt_disc = np.sqrt(np.maximum(discriminant, 0.0))
+                    t1 = (-b - sqrt_disc) / 2.0
+                    t2 = (-b + sqrt_disc) / 2.0
+
+                    # We want the nearest positive t
+                    # If t1 > 0, use t1; elif t2 > 0, use t2 (ray starts inside circle)
+                    t = np.where(t1 > 1e-6, t1, np.where(t2 > 1e-6, t2, self.max_range))
+                    t = np.where(hit_mask, t, self.max_range)
+
+                    distances = np.minimum(distances, t.astype(np.float32))
+
+        # Check workspace boundary walls (4 line segments)
+        xmin, xmax = workspace_bounds['x']
+        ymin, ymax = workspace_bounds['y']
+
+        # Wall: x = xmin (left wall, normal pointing +x)
+        self._intersect_vertical_wall(ox, oy, dx, dy, xmin, ymin, ymax, distances)
+        # Wall: x = xmax (right wall)
+        self._intersect_vertical_wall(ox, oy, dx, dy, xmax, ymin, ymax, distances)
+        # Wall: y = ymin (bottom wall)
+        self._intersect_horizontal_wall(ox, oy, dx, dy, ymin, xmin, xmax, distances)
+        # Wall: y = ymax (top wall)
+        self._intersect_horizontal_wall(ox, oy, dx, dy, ymax, xmin, xmax, distances)
+
+        return np.clip(distances, 0.0, self.max_range)
+
+    def _intersect_vertical_wall(self, ox, oy, dx, dy, wall_x, ymin, ymax, distances):
+        """Intersect rays with a vertical wall at x = wall_x."""
+        # t = (wall_x - ox) / dx
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = (wall_x - ox) / dx
+        # Check t > 0 and intersection y is within wall bounds
+        hit_y = oy + t * dy
+        valid = (t > 1e-6) & (hit_y >= ymin) & (hit_y <= ymax)
+        t_clamped = np.where(valid, t, self.max_range).astype(np.float32)
+        np.minimum(distances, t_clamped, out=distances)
+
+    def _intersect_horizontal_wall(self, ox, oy, dx, dy, wall_y, xmin, xmax, distances):
+        """Intersect rays with a horizontal wall at y = wall_y."""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = (wall_y - oy) / dy
+        hit_x = ox + t * dx
+        valid = (t > 1e-6) & (hit_x >= xmin) & (hit_x <= xmax)
+        t_clamped = np.where(valid, t, self.max_range).astype(np.float32)
+        np.minimum(distances, t_clamped, out=distances)
 
 
 class DemoPlayer:
@@ -1161,7 +1336,8 @@ class JetbotKeyboardController:
                  reward_mode: str = "dense", num_obstacles: int = 5,
                  enable_camera: bool = True, camera_port: int = 5600,
                  automatic: bool = False, num_episodes: int = 100,
-                 continuous: bool = False, headless_tui: bool = False):
+                 continuous: bool = False, headless_tui: bool = False,
+                 use_lidar: bool = False):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -1175,6 +1351,7 @@ class JetbotKeyboardController:
             num_episodes: Number of episodes to collect in automatic mode
             continuous: Ignore num_episodes, run until Esc
             headless_tui: Disable Rich TUI, use console progress prints
+            use_lidar: Enable LiDAR observations for 34D obs (default: False)
         """
         # Create SimulationApp if not already created (e.g., by tests)
         global simulation_app, World, ArticulationAction, WheeledRobot
@@ -1256,6 +1433,7 @@ class JetbotKeyboardController:
         # Recording configuration
         self.enable_recording = enable_recording
         self.reward_mode = reward_mode
+        self.use_lidar = use_lidar
 
         # Generate timestamped filename if no path provided
         if demo_path is None:
@@ -1328,12 +1506,17 @@ class JetbotKeyboardController:
 
     def _init_recording_components(self):
         """Initialize recording components for demonstration collection."""
-        # Initialize demo recorder (10D obs, 2D action)
-        self.recorder = DemoRecorder(obs_dim=10, action_dim=2)
+        # Initialize LiDAR sensor if requested
+        lidar = None
+        if self.use_lidar:
+            lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
 
         # Initialize action mapper and observation builder
         self.action_mapper = ActionMapper()
-        self.obs_builder = ObservationBuilder()
+        self.obs_builder = ObservationBuilder(lidar_sensor=lidar)
+
+        # Initialize demo recorder with correct obs dimension
+        self.recorder = DemoRecorder(obs_dim=self.obs_builder.obs_dim, action_dim=2)
 
         # Initialize reward computer
         self.reward_computer = RewardComputer(mode=self.reward_mode)
@@ -1424,7 +1607,9 @@ class JetbotKeyboardController:
             linear_velocity=self.current_linear_vel,
             angular_velocity=self.current_angular_vel,
             goal_position=goal_position,
-            goal_reached=goal_reached
+            goal_reached=goal_reached,
+            obstacle_metadata=self.scene_manager.get_obstacle_metadata(),
+            workspace_bounds=self.scene_manager.workspace_bounds
         )
 
     def _record_step(self, action: np.ndarray):
@@ -1935,6 +2120,10 @@ def parse_args():
         '--headless-tui', action='store_true',
         help='Disable Rich TUI, use console progress prints'
     )
+    parser.add_argument(
+        '--use-lidar', action='store_true',
+        help='Enable LiDAR observations (34D obs instead of 10D)'
+    )
     return parser.parse_args()
 
 
@@ -1950,6 +2139,7 @@ if __name__ == "__main__":
         automatic=args.automatic,
         num_episodes=args.num_episodes,
         continuous=args.continuous,
-        headless_tui=args.headless_tui
+        headless_tui=args.headless_tui,
+        use_lidar=args.use_lidar
     )
     controller.run()

@@ -32,6 +32,7 @@ from gymnasium import spaces
 
 # Import reusable components from jetbot_keyboard_control
 from jetbot_keyboard_control import (
+    LidarSensor,
     ObservationBuilder,
     RewardComputer,
     SceneManager,
@@ -43,17 +44,18 @@ class JetbotNavigationEnv(gymnasium.Env):
 
     This environment wraps the Isaac Sim simulation of a Jetbot robot
     performing a point-to-point navigation task. The robot must navigate
-    to a goal location.
+    to a goal location while avoiding obstacles using LiDAR sensing.
 
-    Observation Space (10D Box):
-        [0:2]  - Robot position (x, y in meters)
-        [2]    - Robot heading (theta in radians)
-        [3]    - Linear velocity (m/s)
-        [4]    - Angular velocity (rad/s)
-        [5:7]  - Goal position (x, y in meters)
-        [7]    - Distance to goal (meters)
-        [8]    - Angle to goal (radians, relative to robot heading)
-        [9]    - Goal reached flag (0.0 or 1.0)
+    Observation Space (34D Box):
+        [0:2]   - Robot position (x, y in meters)
+        [2]     - Robot heading (theta in radians)
+        [3]     - Linear velocity (m/s)
+        [4]     - Angular velocity (rad/s)
+        [5:7]   - Goal position (x, y in meters)
+        [7]     - Distance to goal (meters)
+        [8]     - Angle to goal (radians, relative to robot heading)
+        [9]     - Goal reached flag (0.0 or 1.0)
+        [10:34] - LiDAR: 24 normalized distances (0=touching, 1=max range)
 
     Action Space (2D Box, continuous [-1, 1]):
         [0]    - Linear velocity command (normalized)
@@ -83,6 +85,12 @@ class JetbotNavigationEnv(gymnasium.Env):
         'x': [-2.0, 2.0],
         'y': [-2.0, 2.0],
     }
+
+    # LiDAR configuration
+    NUM_LIDAR_RAYS = 24
+    LIDAR_FOV_DEG = 180.0
+    LIDAR_MAX_RANGE = 3.0
+    COLLISION_THRESHOLD = 0.08  # Robot effective radius
 
     def __init__(
         self,
@@ -116,11 +124,19 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.goal_threshold = goal_threshold
         self.num_obstacles = num_obstacles
 
-        # Define observation and action spaces
+        # Create LiDAR sensor
+        self.lidar_sensor = LidarSensor(
+            num_rays=self.NUM_LIDAR_RAYS,
+            fov_deg=self.LIDAR_FOV_DEG,
+            max_range=self.LIDAR_MAX_RANGE
+        )
+
+        # Define observation and action spaces (10 base + 24 LiDAR)
+        obs_dim = 10 + self.NUM_LIDAR_RAYS
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(10,),
+            shape=(obs_dim,),
             dtype=np.float32
         )
 
@@ -135,7 +151,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         self._init_isaac_sim()
 
         # Initialize helper components
-        self.obs_builder = ObservationBuilder()
+        self.obs_builder = ObservationBuilder(lidar_sensor=self.lidar_sensor)
         self.reward_computer = RewardComputer(mode=reward_mode)
         self.scene_manager = SceneManager(
             self.world,
@@ -314,10 +330,17 @@ class JetbotNavigationEnv(gymnasium.Env):
         position, _ = self._get_robot_pose()
         goal_reached = self.scene_manager.check_goal_reached(position, threshold=self.goal_threshold)
 
+        # Extract min LiDAR distance from the LiDAR portion of the observation
+        lidar_readings = next_obs[10:]  # Normalized LiDAR values
+        min_lidar = float(lidar_readings.min()) * self.lidar_sensor.max_range
+        collision = min_lidar < self.COLLISION_THRESHOLD
+
         # Build info dict
         info = {
             'goal_reached': goal_reached,
             'is_success': goal_reached,
+            'collision': collision,
+            'min_lidar_distance': min_lidar,
         }
 
         # Compute reward
@@ -336,7 +359,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         """Build observation vector from current state.
 
         Returns:
-            10D observation vector as float32 numpy array
+            34D observation vector as float32 numpy array (10 base + 24 LiDAR)
         """
         # Get robot state
         position, heading = self._get_robot_pose()
@@ -355,7 +378,9 @@ class JetbotNavigationEnv(gymnasium.Env):
             linear_velocity=self._current_linear_vel,
             angular_velocity=self._current_angular_vel,
             goal_position=goal_position,
-            goal_reached=goal_reached
+            goal_reached=goal_reached,
+            obstacle_metadata=self.scene_manager.get_obstacle_metadata(),
+            workspace_bounds=self.workspace_bounds
         )
 
     def _check_termination(self, info, position):
@@ -370,6 +395,10 @@ class JetbotNavigationEnv(gymnasium.Env):
         """
         # SUCCESS: Goal reached
         if info.get('goal_reached', False):
+            return True
+
+        # FAILURE: Collision with obstacle
+        if info.get('collision', False):
             return True
 
         # FAILURE: Robot out of workspace bounds

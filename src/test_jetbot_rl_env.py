@@ -67,11 +67,18 @@ sys.modules['isaacsim.robot.wheeled_robots.controllers'] = mock_isaacsim_robot_w
 class TestSpaces:
     """Tests for observation and action space definitions."""
 
-    def test_observation_space_shape(self):
-        """Test observation space has correct shape."""
+    def test_observation_space_shape_without_lidar(self):
+        """Test observation space has 10D without lidar."""
         from jetbot_keyboard_control import ObservationBuilder
         builder = ObservationBuilder()
         assert builder.obs_dim == 10
+
+    def test_observation_space_shape_with_lidar(self):
+        """Test observation space has 34D with lidar."""
+        from jetbot_keyboard_control import ObservationBuilder, LidarSensor
+        lidar = LidarSensor(num_rays=24)
+        builder = ObservationBuilder(lidar_sensor=lidar)
+        assert builder.obs_dim == 34
 
     def test_action_space_shape(self):
         """Test action space has correct shape."""
@@ -79,8 +86,8 @@ class TestSpaces:
         mapper = ActionMapper()
         assert mapper.action_dim == 2
 
-    def test_observation_building(self):
-        """Test observation can be built correctly."""
+    def test_observation_building_without_lidar(self):
+        """Test observation can be built correctly without lidar."""
         from jetbot_keyboard_control import ObservationBuilder
         builder = ObservationBuilder()
 
@@ -95,6 +102,29 @@ class TestSpaces:
 
         assert obs.shape == (10,)
         assert obs.dtype == np.float32
+
+    def test_observation_building_with_lidar(self):
+        """Test observation building with lidar produces 34D."""
+        from jetbot_keyboard_control import ObservationBuilder, LidarSensor
+        lidar = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+        builder = ObservationBuilder(lidar_sensor=lidar)
+
+        obs = builder.build(
+            robot_position=np.array([0.0, 0.0, 0.05]),
+            robot_heading=0.0,
+            linear_velocity=0.0,
+            angular_velocity=0.0,
+            goal_position=np.array([1.0, 1.0, 0.0]),
+            goal_reached=False,
+            obstacle_metadata=[],
+            workspace_bounds={'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+        )
+
+        assert obs.shape == (34,)
+        assert obs.dtype == np.float32
+        # LiDAR portion should be in [0, 1]
+        assert np.all(obs[10:] >= 0.0)
+        assert np.all(obs[10:] <= 1.0)
 
 
 # ============================================================================
@@ -179,6 +209,28 @@ class TestRewardComputation:
         # (exact value depends on heading bonus calculation)
         assert reward < 1.0  # At least less than distance scale
 
+    def test_collision_terminates_episode(self):
+        """Test that collision causes episode termination."""
+        from jetbot_keyboard_control import RewardComputer
+        computer = RewardComputer(mode='dense')
+
+        reward = computer.compute(
+            obs=np.zeros(10), action=np.zeros(2), next_obs=np.zeros(10),
+            info={'goal_reached': False, 'collision': True}
+        )
+        assert reward == RewardComputer.COLLISION_PENALTY
+
+    def test_collision_reward_in_sparse_mode(self):
+        """Test collision penalty in sparse mode."""
+        from jetbot_keyboard_control import RewardComputer
+        computer = RewardComputer(mode='sparse')
+
+        reward = computer.compute(
+            obs=np.zeros(10), action=np.zeros(2), next_obs=np.zeros(10),
+            info={'goal_reached': False, 'collision': True}
+        )
+        assert reward == RewardComputer.COLLISION_PENALTY
+
 
 # ============================================================================
 # TEST SUITE: Scene Manager
@@ -232,6 +284,33 @@ class TestSceneManagerRL:
 
         # Inside threshold
         assert manager.check_goal_reached(np.array([1.1, 1.0, 0.0]), threshold=0.15)
+
+    def test_obstacle_metadata_initialized_empty(self):
+        """Test obstacle_metadata is initialized as empty list."""
+        from jetbot_keyboard_control import SceneManager
+
+        mock_world = Mock()
+        mock_world.scene = Mock()
+        mock_world.scene.add = Mock(side_effect=lambda x: x)
+
+        manager = SceneManager(mock_world)
+        assert manager.get_obstacle_metadata() == []
+
+    def test_clear_obstacles_clears_metadata(self):
+        """Test clear_obstacles also clears obstacle_metadata."""
+        from jetbot_keyboard_control import SceneManager
+
+        mock_world = Mock()
+        mock_world.scene = Mock()
+        mock_world.scene.add = Mock(side_effect=lambda x: x)
+
+        manager = SceneManager(mock_world)
+        # Manually add metadata
+        manager.obstacle_metadata.append((np.array([1.0, 1.0]), 0.2))
+        assert len(manager.obstacle_metadata) == 1
+
+        manager.clear_obstacles()
+        assert len(manager.obstacle_metadata) == 0
 
 
 # ============================================================================
