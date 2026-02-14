@@ -458,6 +458,10 @@ Examples:
     # Environment arguments
     parser.add_argument('--headless', action='store_true',
                         help='Run without GUI (faster training)')
+    parser.add_argument('--num-obstacles', type=int, default=5,
+                        help='Number of obstacles to spawn (default: 5)')
+    parser.add_argument('--cpu', action='store_true',
+                        help='Force training on CPU instead of GPU')
 
     # BC warmstart arguments
     parser.add_argument('--bc-warmstart', type=str, metavar='DEMO_FILE',
@@ -505,6 +509,7 @@ Examples:
     raw_env = JetbotNavigationEnv(
         reward_mode=args.reward_mode,
         headless=args.headless,
+        num_obstacles=args.num_obstacles,
     )
     print(f"  Observation space: {raw_env.observation_space.shape}")
     print(f"  Action space: {raw_env.action_space.shape}")
@@ -517,10 +522,12 @@ Examples:
 
     # Create PPO model
     print("Creating PPO model...")
+    device = "cpu" if args.cpu else "auto"
     model = PPO(
         "MlpPolicy",
         env,
         verbose=1,
+        device=device,
         tensorboard_log=args.tensorboard_log,
         seed=args.seed,
         # PPO hyperparameters tuned for continuous control
