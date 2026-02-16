@@ -183,39 +183,54 @@ def make_demo_replay_buffer(buffer_cls, buffer_size, observation_space, action_s
 
 
 def inject_layernorm_into_critics(model):
-    """Post-hoc inject LayerNorm after hidden Linear layers in critic networks.
+    """Post-hoc inject LayerNorm + OFN into critic networks.
 
-    Handles both TQC (quantile_critics) and SAC (critic.qf0/qf1) structures.
+    Injects LayerNorm after each hidden Linear layer and Output Feature
+    Normalization (OFN) before the final output Linear layer.
+
+    Handles both TQC (quantile_critics) and SAC (critic.qf*) structures.
     After injection, re-syncs critic_target and recreates the critic optimizer.
     """
+    import torch
     import torch.nn as nn
 
-    def _inject_layernorm(sequential):
-        """Insert LayerNorm after each hidden Linear layer in an nn.Sequential."""
+    class OutputFeatureNorm(nn.Module):
+        """L2-normalize features: x / ||x||_2 (RLC 2024 OFN)."""
+        def forward(self, x):
+            return x / (torch.norm(x, dim=-1, keepdim=True) + 1e-8)
+
+    def _inject_norms(sequential):
+        """Insert LayerNorm after hidden Linears and OFN before output Linear."""
         new_modules = []
         modules = list(sequential)
         for i, module in enumerate(modules):
-            new_modules.append(module)
             if isinstance(module, nn.Linear):
-                # Add LayerNorm after hidden Linear layers (not the output layer)
-                # Output layer is typically the last Linear
                 remaining = modules[i + 1:]
                 has_more_linear = any(isinstance(m, nn.Linear) for m in remaining)
                 if has_more_linear:
+                    # Hidden Linear: append layer, then LayerNorm
+                    new_modules.append(module)
                     new_modules.append(nn.LayerNorm(module.out_features))
+                else:
+                    # Output Linear: insert OFN before it
+                    new_modules.append(OutputFeatureNorm())
+                    new_modules.append(module)
+            else:
+                new_modules.append(module)
         return nn.Sequential(*new_modules)
 
     is_tqc = hasattr(model.critic, 'quantile_critics')
 
     if is_tqc:
         for i, critic_net in enumerate(model.critic.quantile_critics):
-            model.critic.quantile_critics[i] = _inject_layernorm(critic_net)
+            model.critic.quantile_critics[i] = _inject_norms(critic_net)
         for i, critic_net in enumerate(model.critic_target.quantile_critics):
-            model.critic_target.quantile_critics[i] = _inject_layernorm(critic_net)
+            model.critic_target.quantile_critics[i] = _inject_norms(critic_net)
     else:
-        for attr in ('qf0', 'qf1'):
-            setattr(model.critic, attr, _inject_layernorm(getattr(model.critic, attr)))
-            setattr(model.critic_target, attr, _inject_layernorm(getattr(model.critic_target, attr)))
+        qf_attrs = sorted(a for a in dir(model.critic) if a.startswith('qf') and a[2:].isdigit())
+        for attr in qf_attrs:
+            setattr(model.critic, attr, _inject_norms(getattr(model.critic, attr)))
+            setattr(model.critic_target, attr, _inject_norms(getattr(model.critic_target, attr)))
 
     # Move new parameters to device
     model.critic = model.critic.to(model.device)
@@ -224,13 +239,12 @@ def inject_layernorm_into_critics(model):
     # Sync target from critic weights
     model.critic_target.load_state_dict(model.critic.state_dict())
 
-    # Recreate critic optimizer to include LayerNorm parameters
-    import torch
+    # Recreate critic optimizer to include LayerNorm + OFN parameters
     model.critic.optimizer = torch.optim.Adam(
         model.critic.parameters(), lr=model.lr_schedule(1)
     )
 
-    print("LayerNorm injected into critic networks")
+    print("LayerNorm + OFN injected into critic networks")
 
 
 def bc_warmstart_sac(model, demo_obs, demo_actions, epochs=50, batch_size=256, lr=1e-3):
@@ -443,8 +457,8 @@ Examples:
                         help='Discount factor (default: 0.99)')
     parser.add_argument('--tau', type=float, default=0.005,
                         help='Soft update coefficient (default: 0.005)')
-    parser.add_argument('--ent-coef', type=str, default='auto',
-                        help='Entropy coefficient, "auto" for learned (default: auto)')
+    parser.add_argument('--ent-coef', type=str, default='auto_0.006',
+                        help='Entropy coefficient, "auto" or "auto_<init>" for learned (default: auto_0.006)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (default: 42)')
     parser.add_argument('--learning-starts', type=int, default=0,
@@ -502,7 +516,7 @@ Examples:
 
     # Parse ent_coef
     ent_coef = args.ent_coef
-    if ent_coef != 'auto':
+    if not ent_coef.startswith('auto'):
         ent_coef = float(ent_coef)
 
     print("=" * 60)
@@ -624,6 +638,13 @@ Examples:
         print(f"  Model resumed in {_time.time() - _t0:.1f}s")
     else:
         print(f"Creating {algo_name} model...")
+        policy_kwargs = dict(
+            net_arch=dict(pi=[256, 256], qf=[256, 256]),
+            activation_fn=torch.nn.ReLU,
+        )
+        if algo_name == "TQC":
+            policy_kwargs['n_critics'] = 5
+
         model = algo_cls(
             "MlpPolicy",
             env,
@@ -640,10 +661,7 @@ Examples:
             gradient_steps=args.utd_ratio,
             learning_starts=args.learning_starts,
             train_freq=1,
-            policy_kwargs=dict(
-                net_arch=dict(pi=[256, 256], qf=[256, 256]),
-                activation_fn=torch.nn.ReLU,
-            ),
+            policy_kwargs=policy_kwargs,
         )
         # Replace the default replay buffer with our demo buffer
         model.replay_buffer = replay_buffer
