@@ -395,7 +395,8 @@ class SceneManager:
         'y': [-2.0, 2.0],
     }
 
-    def __init__(self, world, workspace_bounds: dict = None, num_obstacles: int = 5):
+    def __init__(self, world, workspace_bounds: dict = None, num_obstacles: int = 5,
+                 min_goal_dist: float = 0.5):
         """Initialize the SceneManager.
 
         Args:
@@ -403,6 +404,7 @@ class SceneManager:
             workspace_bounds: Optional dict with 'x', 'y' keys, each containing
                              [min, max] bounds for random position generation
             num_obstacles: Number of obstacles to spawn (default: 5)
+            min_goal_dist: Minimum distance from robot start to goal (meters)
         """
         self.world = world
         self.goal_marker = None
@@ -413,6 +415,7 @@ class SceneManager:
         self.obstacle_metadata = []  # List of (position_2d, effective_radius) tuples
         self.obstacle_counter = 0
         self.num_obstacles = num_obstacles
+        self.min_goal_dist = min_goal_dist
 
     def spawn_goal_marker(self, position: list = None, color: tuple = (1.0, 0.5, 0.0, 1.0)) -> np.ndarray:
         """Spawn a visual goal marker in the scene.
@@ -686,14 +689,11 @@ class SceneManager:
             # Fall back to no obstacles for testing
             pass
 
-    def _generate_safe_goal_position(self, min_distance_from_start: float = 0.5) -> list:
+    def _generate_safe_goal_position(self) -> list:
         """Generate a goal position that is not too close to the robot start.
 
         Uses rejection sampling with a fallback to place the goal at exactly
-        min_distance_from_start in a random direction.
-
-        Args:
-            min_distance_from_start: Minimum distance from origin (meters)
+        min_goal_dist in a random direction.
 
         Returns:
             [x, y, z] position list
@@ -704,13 +704,13 @@ class SceneManager:
         for _ in range(max_attempts):
             pos = self._random_position()
             pos_2d = np.array(pos[:2])
-            if np.linalg.norm(pos_2d - robot_start) >= min_distance_from_start:
+            if np.linalg.norm(pos_2d - robot_start) >= self.min_goal_dist:
                 return pos
 
-        # Fallback: place at exactly min_distance_from_start in a random direction
+        # Fallback: place at exactly min_goal_dist in a random direction
         angle = np.random.uniform(0, 2 * np.pi)
-        x = min_distance_from_start * np.cos(angle)
-        y = min_distance_from_start * np.sin(angle)
+        x = self.min_goal_dist * np.cos(angle)
+        y = self.min_goal_dist * np.sin(angle)
         return [x, y, 0.01]
 
     def _random_position(self) -> list:
@@ -1697,7 +1697,9 @@ class JetbotKeyboardController:
                  automatic: bool = False, num_episodes: int = 100,
                  continuous: bool = False, headless_tui: bool = False,
                  use_lidar: bool = False, arena_size: float = 4.0,
-                 max_steps: int = 500):
+                 max_steps: int = 500, draw_lines: bool = False,
+                 min_goal_dist: float = 0.5,
+                 inflation_radius: float = 0.08):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -1714,6 +1716,9 @@ class JetbotKeyboardController:
             use_lidar: Enable LiDAR observations for 34D obs (default: False)
             arena_size: Side length of square arena in meters (default: 4.0)
             max_steps: Maximum steps per episode (default: 500)
+            draw_lines: Enable debug draw overlays in viewport (default: False)
+            min_goal_dist: Minimum distance from robot start to goal (meters)
+            inflation_radius: Obstacle inflation radius for A* planner (meters)
         """
         # Create SimulationApp if not already created (e.g., by tests)
         global simulation_app, World, ArticulationAction, WheeledRobot
@@ -1747,6 +1752,13 @@ class JetbotKeyboardController:
             except ImportError as e:
                 print(f"[Warning] Camera streaming not available: {e}")
                 CAMERA_STREAMING_AVAILABLE = False
+
+        # Debug draw overlay
+        self.draw_lines = draw_lines
+        self._debug_draw = None
+        if self.draw_lines:
+            from isaacsim.util.debug_draw import _debug_draw
+            self._debug_draw = _debug_draw.acquire_debug_draw_interface()
 
         # Create TUI renderer
         self.tui = TUIRenderer()
@@ -1829,7 +1841,8 @@ class JetbotKeyboardController:
         half = arena_size / 2.0
         workspace_bounds = {'x': [-half, half], 'y': [-half, half]}
         self.scene_manager = SceneManager(
-            self.world, workspace_bounds=workspace_bounds, num_obstacles=num_obstacles
+            self.world, workspace_bounds=workspace_bounds, num_obstacles=num_obstacles,
+            min_goal_dist=min_goal_dist,
         )
 
         # Initialize recording components if enabled
@@ -1846,10 +1859,12 @@ class JetbotKeyboardController:
         self.num_episodes = num_episodes
         self.continuous = continuous
         self.headless_tui = headless_tui
+        self.inflation_radius = inflation_radius
         self.auto_pilot = AutoPilot(
             max_linear_vel=self.MAX_LINEAR_VELOCITY,
             max_angular_vel=self.MAX_ANGULAR_VELOCITY,
             scene_manager=self.scene_manager,
+            robot_radius=inflation_radius,
         ) if automatic else None
         self.auto_episode_count = 0
         self.auto_step_count = 0
@@ -2074,6 +2089,7 @@ class JetbotKeyboardController:
         if self.auto_pilot is not None:
             self.auto_pilot.reset()
             self._plan_autopilot_path()
+            self._draw_debug_overlays()
 
         # Rebuild observation for next episode
         self.current_obs = self._build_current_observation()
@@ -2098,6 +2114,36 @@ class JetbotKeyboardController:
                 return
             self.scene_manager.reset_goal()
             self.current_obs = self._build_current_observation()
+
+    def _draw_debug_overlays(self):
+        """Draw debug overlays in the Isaac Sim viewport (obstacle keep-out zones and A* path)."""
+        if self._debug_draw is None:
+            return
+
+        import math
+
+        self._debug_draw.clear_lines()
+        self._debug_draw.clear_points()
+
+        z = 0.02
+        num_segments = 32
+
+        # Draw red circles around obstacles (inflated keep-out zones)
+        for center_2d, radius in self.scene_manager.get_obstacle_metadata():
+            inflated_r = radius + self.inflation_radius
+            points = []
+            for i in range(num_segments + 1):
+                angle = 2.0 * math.pi * i / num_segments
+                px = center_2d[0] + inflated_r * math.cos(angle)
+                py = center_2d[1] + inflated_r * math.sin(angle)
+                points.append((px, py, z))
+            self._debug_draw.draw_lines_spline(points, (1.0, 0.0, 0.0, 1.0), 2.0, False)
+
+        # Draw green path line from A* waypoints
+        if self.auto_pilot is not None and self.auto_pilot._path:
+            path_points = [(wp[0], wp[1], z) for wp in self.auto_pilot._path]
+            if len(path_points) >= 2:
+                self._debug_draw.draw_lines_spline(path_points, (0.0, 1.0, 0.0, 1.0), 3.0, False)
 
     def _on_key_press(self, key):
         """Handle key press events from pynput."""
@@ -2353,6 +2399,10 @@ class JetbotKeyboardController:
         if self.automatic and self.auto_pilot is not None:
             self._plan_autopilot_path()
 
+        # Draw debug overlays if enabled
+        if self.draw_lines:
+            self._draw_debug_overlays()
+
         reset_needed = False
         last_key_processed = None
 
@@ -2549,7 +2599,39 @@ def parse_args():
         '--max-steps', type=int, default=500,
         help='Maximum steps per episode (default: 500)'
     )
-    return parser.parse_args()
+    parser.add_argument(
+        '--draw-lines', action='store_true',
+        help='Enable debug draw overlays in viewport (obstacle keep-out zones and A* path)'
+    )
+    parser.add_argument(
+        '--min-goal', type=float, default=0.5,
+        help='Minimum distance from robot start to goal in meters (default: 0.5)'
+    )
+    parser.add_argument(
+        '--inflation-radius', type=float, default=0.08,
+        help='Obstacle inflation radius for A* planner in meters (default: 0.08)'
+    )
+    args = parser.parse_args()
+
+    # Validate --min-goal against --arena-size
+    half = args.arena_size / 2.0
+    max_possible = (half ** 2 + half ** 2) ** 0.5  # diagonal from center to corner
+    if args.min_goal < 0:
+        parser.error("--min-goal must be non-negative")
+    if args.min_goal >= max_possible:
+        parser.error(
+            f"--min-goal ({args.min_goal:.2f}) must be less than the arena diagonal "
+            f"from center ({max_possible:.2f}m) for --arena-size {args.arena_size}"
+        )
+    if args.inflation_radius < 0:
+        parser.error("--inflation-radius must be non-negative")
+    if args.inflation_radius >= half:
+        parser.error(
+            f"--inflation-radius ({args.inflation_radius:.2f}) must be less than "
+            f"half the arena size ({half:.2f}m) for --arena-size {args.arena_size}"
+        )
+
+    return args
 
 
 if __name__ == "__main__":
@@ -2568,5 +2650,8 @@ if __name__ == "__main__":
         use_lidar=args.use_lidar,
         arena_size=args.arena_size,
         max_steps=args.max_steps,
+        draw_lines=args.draw_lines,
+        min_goal_dist=args.min_goal,
+        inflation_radius=args.inflation_radius,
     )
     controller.run()
