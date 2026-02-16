@@ -439,3 +439,341 @@ class TestIntegration:
         obs, actions = player.get_episode(0)
         assert len(obs) == 10
         assert len(actions) == 10
+
+
+# ============================================================================
+# TEST SUITE: JetbotNavigationEnv (with mocked Isaac Sim initialization)
+# ============================================================================
+
+class TestJetbotNavigationEnvInit:
+    """Tests for JetbotNavigationEnv initialization with Isaac Sim mocked."""
+
+    @pytest.fixture
+    def env(self):
+        """Create a JetbotNavigationEnv with _init_isaac_sim mocked out."""
+        from jetbot_rl_env import JetbotNavigationEnv
+
+        with patch.object(JetbotNavigationEnv, '_init_isaac_sim'):
+            env = JetbotNavigationEnv.__new__(JetbotNavigationEnv)
+            # Call __init__ manually to set up spaces without Isaac Sim
+            env.reward_mode = 'dense'
+            env.max_episode_steps = 500
+            env.workspace_bounds = {'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+            env.render_mode = 'human'
+            env.headless = True
+            env.goal_threshold = 0.15
+            env.num_obstacles = 5
+            env.min_goal_dist = 0.5
+
+            from jetbot_keyboard_control import LidarSensor, ObservationBuilder, RewardComputer
+            env.lidar_sensor = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+
+            obs_dim = 10 + 24
+            from gymnasium import spaces
+            env.observation_space = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+            )
+            env.action_space = spaces.Box(
+                low=-1.0, high=1.0, shape=(2,), dtype=np.float32
+            )
+
+            env.obs_builder = ObservationBuilder(lidar_sensor=env.lidar_sensor)
+            env.reward_computer = RewardComputer(mode='dense')
+            env._step_count = 0
+            env._prev_obs = None
+            env._current_linear_vel = 0.0
+            env._current_angular_vel = 0.0
+
+            yield env
+
+    def test_observation_space(self, env):
+        assert env.observation_space.shape == (34,)
+
+    def test_action_space(self, env):
+        assert env.action_space.shape == (2,)
+        np.testing.assert_array_equal(env.action_space.low, [-1.0, -1.0])
+        np.testing.assert_array_equal(env.action_space.high, [1.0, 1.0])
+
+    def test_reward_mode_stored(self, env):
+        assert env.reward_mode == 'dense'
+
+    def test_max_episode_steps(self, env):
+        assert env.max_episode_steps == 500
+
+
+class TestCheckTermination:
+    """Tests for _check_termination method."""
+
+    @pytest.fixture
+    def env(self):
+        from jetbot_rl_env import JetbotNavigationEnv
+
+        with patch.object(JetbotNavigationEnv, '_init_isaac_sim'):
+            env = JetbotNavigationEnv.__new__(JetbotNavigationEnv)
+            env.workspace_bounds = {'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+            yield env
+
+    def test_goal_reached_terminates(self, env):
+        info = {'goal_reached': True, 'collision': False}
+        assert env._check_termination(info, np.array([0.0, 0.0, 0.0])) is True
+
+    def test_collision_terminates(self, env):
+        info = {'goal_reached': False, 'collision': True}
+        assert env._check_termination(info, np.array([0.0, 0.0, 0.0])) is True
+
+    def test_out_of_bounds_terminates(self, env):
+        info = {'goal_reached': False, 'collision': False}
+        # Way outside bounds
+        assert env._check_termination(info, np.array([10.0, 0.0, 0.0])) is True
+
+    def test_no_termination(self, env):
+        info = {'goal_reached': False, 'collision': False}
+        assert env._check_termination(info, np.array([0.0, 0.0, 0.0])) is False
+
+
+class TestCheckTruncation:
+    """Tests for _check_truncation method."""
+
+    @pytest.fixture
+    def env(self):
+        from jetbot_rl_env import JetbotNavigationEnv
+
+        with patch.object(JetbotNavigationEnv, '_init_isaac_sim'):
+            env = JetbotNavigationEnv.__new__(JetbotNavigationEnv)
+            env.max_episode_steps = 500
+            yield env
+
+    def test_at_max_steps(self, env):
+        env._step_count = 500
+        assert env._check_truncation() is True
+
+    def test_above_max_steps(self, env):
+        env._step_count = 501
+        assert env._check_truncation() is True
+
+    def test_below_max_steps(self, env):
+        env._step_count = 499
+        assert env._check_truncation() is False
+
+    def test_at_zero(self, env):
+        env._step_count = 0
+        assert env._check_truncation() is False
+
+
+class TestIsOutOfBounds:
+    """Tests for _is_out_of_bounds method."""
+
+    @pytest.fixture
+    def env(self):
+        from jetbot_rl_env import JetbotNavigationEnv
+
+        with patch.object(JetbotNavigationEnv, '_init_isaac_sim'):
+            env = JetbotNavigationEnv.__new__(JetbotNavigationEnv)
+            env.workspace_bounds = {'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+            yield env
+
+    def test_within_bounds(self, env):
+        assert not env._is_out_of_bounds(np.array([0.0, 0.0, 0.0]))
+
+    def test_outside_x(self, env):
+        assert env._is_out_of_bounds(np.array([5.0, 0.0, 0.0]))
+
+    def test_outside_y(self, env):
+        assert env._is_out_of_bounds(np.array([0.0, -5.0, 0.0]))
+
+    def test_within_margin(self, env):
+        """Position just beyond bounds but within 0.5 margin → not out of bounds."""
+        assert not env._is_out_of_bounds(np.array([2.3, 0.0, 0.0]))
+
+    def test_beyond_margin(self, env):
+        """Position beyond bounds + 0.5 margin → out of bounds."""
+        assert env._is_out_of_bounds(np.array([2.6, 0.0, 0.0]))
+
+    def test_negative_outside(self, env):
+        assert env._is_out_of_bounds(np.array([-3.0, 0.0, 0.0]))
+
+
+class TestBuildObservation:
+    """Tests for _build_observation method."""
+
+    @pytest.fixture
+    def env(self):
+        from jetbot_rl_env import JetbotNavigationEnv
+        from jetbot_keyboard_control import LidarSensor, ObservationBuilder, SceneManager
+
+        with patch.object(JetbotNavigationEnv, '_init_isaac_sim'):
+            env = JetbotNavigationEnv.__new__(JetbotNavigationEnv)
+            env.workspace_bounds = {'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+            env.goal_threshold = 0.15
+            env.lidar_sensor = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+            env.obs_builder = ObservationBuilder(lidar_sensor=env.lidar_sensor)
+            env._current_linear_vel = 0.0
+            env._current_angular_vel = 0.0
+
+            # Mock scene_manager and _get_robot_pose
+            env.scene_manager = Mock()
+            env.scene_manager.get_goal_position.return_value = np.array([1.0, 1.0, 0.0])
+            env.scene_manager.check_goal_reached.return_value = False
+            env.scene_manager.get_obstacle_metadata.return_value = []
+
+            env.jetbot = Mock()
+
+            yield env
+
+    def test_output_shape(self, env):
+        with patch.object(type(env), '_get_robot_pose',
+                         return_value=(np.array([0.0, 0.0, 0.05]), 0.0)):
+            obs = env._build_observation()
+            assert obs.shape == (34,)
+            assert obs.dtype == np.float32
+
+    def test_lidar_included(self, env):
+        with patch.object(type(env), '_get_robot_pose',
+                         return_value=(np.array([0.0, 0.0, 0.05]), 0.0)):
+            obs = env._build_observation()
+            lidar_portion = obs[10:]
+            assert len(lidar_portion) == 24
+            # All lidar readings should be in [0, 1] (no obstacles)
+            assert np.all(lidar_portion >= 0.0)
+            assert np.all(lidar_portion <= 1.0)
+
+
+class TestStep:
+    """Tests for step method."""
+
+    @pytest.fixture
+    def env(self):
+        from jetbot_rl_env import JetbotNavigationEnv
+        from jetbot_keyboard_control import (
+            LidarSensor, ObservationBuilder, RewardComputer, SceneManager
+        )
+
+        with patch.object(JetbotNavigationEnv, '_init_isaac_sim'):
+            env = JetbotNavigationEnv.__new__(JetbotNavigationEnv)
+            env.reward_mode = 'dense'
+            env.max_episode_steps = 500
+            env.workspace_bounds = {'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+            env.headless = True
+            env.goal_threshold = 0.15
+            env.lidar_sensor = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+            env.obs_builder = ObservationBuilder(lidar_sensor=env.lidar_sensor)
+            env.reward_computer = RewardComputer(mode='dense')
+            env._step_count = 0
+            env._prev_obs = np.zeros(34, dtype=np.float32)
+            env._prev_obs[7] = 2.0  # distance to goal
+            env._current_linear_vel = 0.0
+            env._current_angular_vel = 0.0
+
+            env.MAX_LINEAR_VELOCITY = 0.3
+            env.MAX_ANGULAR_VELOCITY = 1.0
+            env.COLLISION_THRESHOLD = 0.08
+
+            # Mock Isaac Sim objects
+            env.world = Mock()
+            env.jetbot = Mock()
+            env.controller = Mock()
+            env.controller.forward.return_value = Mock()
+            env.scene_manager = Mock()
+            env.scene_manager.get_goal_position.return_value = np.array([1.0, 1.0, 0.0])
+            env.scene_manager.check_goal_reached.return_value = False
+            env.scene_manager.get_obstacle_metadata.return_value = []
+
+            yield env
+
+    def test_step_count_increments(self, env):
+        with patch.object(type(env), '_get_robot_pose',
+                         return_value=(np.array([0.0, 0.0, 0.05]), 0.0)):
+            assert env._step_count == 0
+            env.step(np.array([0.0, 0.0]))
+            assert env._step_count == 1
+
+    def test_returns_five_tuple(self, env):
+        with patch.object(type(env), '_get_robot_pose',
+                         return_value=(np.array([0.0, 0.0, 0.05]), 0.0)):
+            result = env.step(np.array([0.0, 0.0]))
+            assert len(result) == 5
+            obs, reward, terminated, truncated, info = result
+            assert obs.shape == (34,)
+            assert isinstance(reward, float)
+            assert isinstance(terminated, bool)
+            assert isinstance(truncated, bool)
+            assert isinstance(info, dict)
+
+    def test_action_clipping(self, env):
+        with patch.object(type(env), '_get_robot_pose',
+                         return_value=(np.array([0.0, 0.0, 0.05]), 0.0)):
+            # Pass actions outside [-1, 1]
+            env.step(np.array([5.0, -5.0]))
+            # Velocities should be clamped
+            assert env._current_linear_vel == pytest.approx(0.3)   # 1.0 * 0.3
+            assert env._current_angular_vel == pytest.approx(-1.0)  # -1.0 * 1.0
+
+
+class TestReset:
+    """Tests for reset method."""
+
+    @pytest.fixture
+    def env(self):
+        from jetbot_rl_env import JetbotNavigationEnv
+        from jetbot_keyboard_control import (
+            LidarSensor, ObservationBuilder, RewardComputer
+        )
+        import gymnasium
+
+        with patch.object(JetbotNavigationEnv, '_init_isaac_sim'):
+            env = JetbotNavigationEnv.__new__(JetbotNavigationEnv)
+            env.reward_mode = 'dense'
+            env.max_episode_steps = 500
+            env.workspace_bounds = {'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
+            env.headless = True
+            env.goal_threshold = 0.15
+            env.lidar_sensor = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
+            env.obs_builder = ObservationBuilder(lidar_sensor=env.lidar_sensor)
+            env.reward_computer = RewardComputer(mode='dense')
+            env._step_count = 100
+            env._prev_obs = None
+            env._current_linear_vel = 0.5
+            env._current_angular_vel = 0.5
+
+            env.START_POSITION = np.array([0.0, 0.0, 0.05])
+
+            from gymnasium import spaces
+            obs_dim = 34
+            env.observation_space = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+            )
+            env.action_space = spaces.Box(
+                low=-1.0, high=1.0, shape=(2,), dtype=np.float32
+            )
+
+            # Mock Isaac Sim objects
+            env.world = Mock()
+            env.jetbot = Mock()
+            env.scene_manager = Mock()
+            env.scene_manager.get_goal_position.return_value = np.array([1.0, 1.0, 0.0])
+            env.scene_manager.check_goal_reached.return_value = False
+            env.scene_manager.get_obstacle_metadata.return_value = []
+
+            # Need np_random for reset()
+            env.np_random = np.random.default_rng(42)
+
+            yield env
+
+    def test_step_count_reset(self, env):
+        with patch.object(type(env), '_get_robot_pose',
+                         return_value=(np.array([0.0, 0.0, 0.05]), 0.0)):
+            # Patch super().reset to not call gymnasium.Env.reset
+            with patch('gymnasium.Env.reset', return_value=None):
+                env.reset()
+            assert env._step_count == 0
+
+    def test_returns_obs_and_info(self, env):
+        with patch.object(type(env), '_get_robot_pose',
+                         return_value=(np.array([0.0, 0.0, 0.05]), 0.0)):
+            with patch('gymnasium.Env.reset', return_value=None):
+                result = env.reset()
+            assert len(result) == 2
+            obs, info = result
+            assert obs.shape == (34,)
+            assert isinstance(info, dict)
+            assert 'is_success' in info

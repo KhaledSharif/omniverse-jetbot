@@ -118,8 +118,8 @@ def load_demo_transitions(npz_path: str):
 
 def make_demo_replay_buffer(buffer_cls, buffer_size, observation_space, action_space,
                             device, demo_obs, demo_actions, demo_rewards,
-                            demo_next_obs, demo_dones):
-    """Create a replay buffer that samples 50/50 from demos and online data.
+                            demo_next_obs, demo_dones, demo_ratio=0.5):
+    """Create a replay buffer that mixes demos and online data at a given ratio.
 
     Returns a subclass instance of the given buffer_cls that overrides sample()
     to mix demo and online transitions.
@@ -144,7 +144,7 @@ def make_demo_replay_buffer(buffer_cls, buffer_size, observation_space, action_s
                 demo_batch_size = batch_size
                 online_batch_size = 0
             else:
-                demo_batch_size = batch_size // 2
+                demo_batch_size = int(batch_size * demo_ratio)
                 online_batch_size = batch_size - demo_batch_size
 
             # Sample demo indices
@@ -449,6 +449,8 @@ Examples:
                         help='Random seed (default: 42)')
     parser.add_argument('--learning-starts', type=int, default=0,
                         help='Steps before training starts (default: 0, demos available immediately)')
+    parser.add_argument('--demo-ratio', type=float, default=0.5,
+                        help='Fraction of each batch sampled from demos, 0.0-1.0 (default: 0.5)')
 
     # BC warmstart arguments
     parser.add_argument('--bc-epochs', type=int, default=50,
@@ -479,6 +481,8 @@ Examples:
     # Checkpoint arguments
     parser.add_argument('--checkpoint-freq', type=int, default=50000,
                         help='Save checkpoint every N steps (default: 50000)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint .zip to resume training from')
 
     # Logging arguments
     parser.add_argument('--more-debug', action='store_true',
@@ -491,6 +495,10 @@ Examples:
                         help='TensorBoard log directory (default: ./runs/)')
 
     args = parser.parse_args()
+
+    # Validate demo_ratio
+    if not 0.0 <= args.demo_ratio <= 1.0:
+        parser.error(f"--demo-ratio must be between 0.0 and 1.0, got {args.demo_ratio}")
 
     # Parse ent_coef
     ent_coef = args.ent_coef
@@ -509,6 +517,7 @@ Examples:
     print(f"  Gamma: {args.gamma}")
     print(f"  Tau: {args.tau}")
     print(f"  Entropy coef: {ent_coef}")
+    print(f"  Demo ratio: {args.demo_ratio}")
     print(f"  Learning starts: {args.learning_starts}")
     print(f"  Reward mode: {args.reward_mode}")
     print(f"  Headless: {args.headless}")
@@ -516,6 +525,8 @@ Examples:
     print(f"  Max steps/episode: {args.max_steps}")
     print(f"  Output: {args.output}")
     print(f"  TensorBoard: {args.tensorboard_log}")
+    if args.resume:
+        print(f"  Resuming from: {args.resume}")
     print("=" * 60 + "\n")
 
     # Validate demo data first (fail fast)
@@ -585,41 +596,60 @@ Examples:
         demo_rewards=demo_rewards,
         demo_next_obs=demo_next_obs,
         demo_dones=demo_dones,
+        demo_ratio=args.demo_ratio,
     )
     print(f"Demo replay buffer created: {len(demo_obs)} demo transitions")
     print()
 
-    # Create model
+    # Create or resume model
     _t0 = _time.time()
-    print(f"Creating {algo_name} model...")
-    model = algo_cls(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        device=device_str,
-        tensorboard_log=args.tensorboard_log,
-        seed=args.seed,
-        learning_rate=args.lr,
-        buffer_size=args.buffer_size,
-        batch_size=args.batch_size,
-        gamma=args.gamma,
-        tau=args.tau,
-        ent_coef=ent_coef,
-        gradient_steps=args.utd_ratio,
-        learning_starts=args.learning_starts,
-        train_freq=1,
-        policy_kwargs=dict(
-            net_arch=dict(pi=[256, 256], qf=[256, 256]),
-            activation_fn=torch.nn.ReLU,
-        ),
-    )
-
-    # Replace the default replay buffer with our demo buffer
-    model.replay_buffer = replay_buffer
-
-    # Inject LayerNorm into critics
-    inject_layernorm_into_critics(model)
-    print(f"  Model created in {_time.time() - _t0:.1f}s")
+    if args.resume:
+        print(f"Resuming {algo_name} model from {args.resume}...")
+        model = algo_cls.load(
+            args.resume,
+            env=env,
+            device=device_str,
+            tensorboard_log=args.tensorboard_log,
+        )
+        # Override mutable hyperparams the user may have changed
+        model.learning_rate = args.lr
+        model.batch_size = args.batch_size
+        model.gamma = args.gamma
+        model.tau = args.tau
+        model.gradient_steps = args.utd_ratio
+        model.ent_coef = ent_coef
+        # Replace replay buffer with fresh demo buffer (online data is lost)
+        model.replay_buffer = replay_buffer
+        # LayerNorm is already baked into the loaded checkpoint weights
+        print(f"  Model resumed in {_time.time() - _t0:.1f}s")
+    else:
+        print(f"Creating {algo_name} model...")
+        model = algo_cls(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            device=device_str,
+            tensorboard_log=args.tensorboard_log,
+            seed=args.seed,
+            learning_rate=args.lr,
+            buffer_size=args.buffer_size,
+            batch_size=args.batch_size,
+            gamma=args.gamma,
+            tau=args.tau,
+            ent_coef=ent_coef,
+            gradient_steps=args.utd_ratio,
+            learning_starts=args.learning_starts,
+            train_freq=1,
+            policy_kwargs=dict(
+                net_arch=dict(pi=[256, 256], qf=[256, 256]),
+                activation_fn=torch.nn.ReLU,
+            ),
+        )
+        # Replace the default replay buffer with our demo buffer
+        model.replay_buffer = replay_buffer
+        # Inject LayerNorm into critics
+        inject_layernorm_into_critics(model)
+        print(f"  Model created in {_time.time() - _t0:.1f}s")
     print()
 
     # BC warmstart on actor
@@ -660,6 +690,7 @@ Examples:
             total_timesteps=args.timesteps,
             callback=callback,
             progress_bar=True,
+            reset_num_timesteps=not args.resume,
         )
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user.")

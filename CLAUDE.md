@@ -30,10 +30,11 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 
 4. **SAC/TQC + RLPD Pipeline** (`src/train_sac.py`)
    - TQC (sb3-contrib) with SAC fallback
-   - RLPD-style 50/50 demo/online replay buffer sampling
+   - RLPD-style demo/online replay buffer sampling (configurable via `--demo-ratio`)
    - LayerNorm in critics (replaces VecNormalize)
    - UTD ratio configurable via `--utd-ratio` (default 20, recommended 5 for speed)
    - No pretraining phases — demos sampled continuously
+   - `--resume` to continue training from a checkpoint (step counter, weights preserved)
 
 5. **Supporting Scripts**
    - `eval_policy.py` - Policy evaluation and metrics (auto-detects TQC/SAC/PPO)
@@ -152,6 +153,12 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 
 # SAC/TQC with custom UTD ratio and buffer size
 ./run.sh train_sac.py --demos demos/recording.npz --headless --utd-ratio 20 --buffer-size 300000
+
+# SAC/TQC with custom demo ratio (75% demo, 25% online)
+./run.sh train_sac.py --demos demos/recording.npz --headless --demo-ratio 0.75
+
+# Resume SAC/TQC training from checkpoint
+./run.sh train_sac.py --demos demos/recording.npz --headless --resume models/checkpoints/tqc_jetbot_50000_steps.zip --timesteps 500000
 
 # Evaluation (auto-detects TQC/SAC/PPO)
 ./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100

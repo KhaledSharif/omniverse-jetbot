@@ -15,6 +15,30 @@ import numpy as np
 from pathlib import Path
 
 
+def compute_eval_metrics(successes, total_rewards, episode_lengths, total_episodes):
+    """Compute evaluation metrics from episode results.
+
+    Args:
+        successes: Number of successful episodes
+        total_rewards: List of per-episode total rewards
+        episode_lengths: List of per-episode step counts
+        total_episodes: Total number of episodes evaluated
+
+    Returns:
+        Dict with keys: success_rate, avg_reward, std_reward, avg_length,
+        std_length, min_reward, max_reward
+    """
+    return {
+        'success_rate': 100 * successes / total_episodes,
+        'avg_reward': float(np.mean(total_rewards)),
+        'std_reward': float(np.std(total_rewards)),
+        'avg_length': float(np.mean(episode_lengths)),
+        'std_length': float(np.std(episode_lengths)),
+        'min_reward': float(np.min(total_rewards)),
+        'max_reward': float(np.max(total_rewards)),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Evaluate trained PPO policy on Jetbot navigation task',
@@ -178,21 +202,17 @@ Examples:
               f"reward={episode_reward:8.2f}, steps={steps:4d}, {status}")
 
     # Compute statistics
-    success_rate = 100 * successes / args.episodes
-    avg_reward = np.mean(total_rewards)
-    std_reward = np.std(total_rewards)
-    avg_length = np.mean(episode_lengths)
-    std_length = np.std(episode_lengths)
+    metrics = compute_eval_metrics(successes, total_rewards, episode_lengths, args.episodes)
 
     # Print summary
     print("\n" + "=" * 60)
     print("Evaluation Summary")
     print("=" * 60)
-    print(f"  Success rate:      {successes}/{args.episodes} ({success_rate:.1f}%)")
-    print(f"  Average reward:    {avg_reward:.2f} +/- {std_reward:.2f}")
-    print(f"  Average length:    {avg_length:.1f} +/- {std_length:.1f} steps")
-    print(f"  Min reward:        {np.min(total_rewards):.2f}")
-    print(f"  Max reward:        {np.max(total_rewards):.2f}")
+    print(f"  Success rate:      {successes}/{args.episodes} ({metrics['success_rate']:.1f}%)")
+    print(f"  Average reward:    {metrics['avg_reward']:.2f} +/- {metrics['std_reward']:.2f}")
+    print(f"  Average length:    {metrics['avg_length']:.1f} +/- {metrics['std_length']:.1f} steps")
+    print(f"  Min reward:        {metrics['min_reward']:.2f}")
+    print(f"  Max reward:        {metrics['max_reward']:.2f}")
     print("=" * 60)
 
     # Return success rate as exit code (0-100)

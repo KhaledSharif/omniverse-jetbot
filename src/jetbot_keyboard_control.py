@@ -1349,6 +1349,11 @@ class AutoPilot:
 
         self._path = []
         self._current_waypoint_idx = 0
+        self._replan_attempted = False
+        self._cached_occ_grid = None
+        self._using_fallback = False
+        self._fallback_triggered = False
+        self._fallback_origin = None
 
     def plan_path(self, robot_position_2d):
         """Build occupancy grid from scene and run A*.
@@ -1366,25 +1371,67 @@ class AutoPilot:
         if goal is None:
             return False
 
-        occ_grid = OccupancyGrid.from_scene(
-            self.scene_manager.get_obstacle_metadata(),
-            self.scene_manager.workspace_bounds,
-            robot_radius=self.robot_radius,
-            cell_size=self.cell_size,
-        )
+        if self._cached_occ_grid is None:
+            self._cached_occ_grid = OccupancyGrid.from_scene(
+                self.scene_manager.get_obstacle_metadata(),
+                self.scene_manager.workspace_bounds,
+                robot_radius=self.robot_radius,
+                cell_size=self.cell_size,
+            )
 
         start = (float(robot_position_2d[0]), float(robot_position_2d[1]))
         goal_2d = (float(goal[0]), float(goal[1]))
 
-        self._path = astar_search(occ_grid, start, goal_2d)
+        self._path = astar_search(self._cached_occ_grid, start, goal_2d)
         self._current_waypoint_idx = 0
 
         return len(self._path) > 0
+
+    def _perpendicular_distance_to_segment(self, robot_x, robot_y):
+        """Point-to-segment distance from robot to current path segment.
+
+        Computes distance from (robot_x, robot_y) to the line segment
+        between path[idx-1] and path[idx]. Falls back to Euclidean
+        distance to path[idx] when idx == 0 (degenerate case).
+        """
+        idx = self._current_waypoint_idx
+        if idx == 0 or not self._path:
+            if self._path:
+                wp = self._path[idx]
+                return ((robot_x - wp[0]) ** 2 + (robot_y - wp[1]) ** 2) ** 0.5
+            return 0.0
+
+        ax, ay = self._path[idx - 1]
+        bx, by = self._path[idx]
+        abx, aby = bx - ax, by - ay
+        apx, apy = robot_x - ax, robot_y - ay
+
+        ab_sq = abx * abx + aby * aby
+        if ab_sq < 1e-12:
+            return ((robot_x - ax) ** 2 + (robot_y - ay) ** 2) ** 0.5
+
+        t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab_sq))
+        proj_x = ax + t * abx
+        proj_y = ay + t * aby
+        return ((robot_x - proj_x) ** 2 + (robot_y - proj_y) ** 2) ** 0.5
+
+    def _should_replan(self, robot_x, robot_y):
+        """Check if a replan is needed based on perpendicular deviation.
+
+        Returns False if a replan was already attempted since the last
+        waypoint advance (cooldown).
+        """
+        if self._replan_attempted:
+            return False
+        return self._perpendicular_distance_to_segment(robot_x, robot_y) > self.replan_deviation
 
     def compute_action(self, obs):
         """Compute velocity command using pure-pursuit on A* path.
 
         Falls back to proportional control if no path is available.
+
+        Phase 1: Advance waypoints and check for replan.
+        Phase 2: Re-read target from (possibly updated) path for steering.
 
         Args:
             obs: Observation vector (10D or 34D)
@@ -1395,24 +1442,35 @@ class AutoPilot:
         robot_x, robot_y = obs[0], obs[1]
         heading = obs[2]
 
-        # If we have a valid path, use pure-pursuit
+        # --- Phase 1: waypoint advancement + replan check ---
         if self._path and self._current_waypoint_idx < len(self._path):
             # Advance waypoint index past those within lookahead
+            advanced = False
             while self._current_waypoint_idx < len(self._path) - 1:
                 wp = self._path[self._current_waypoint_idx]
                 dist_to_wp = ((robot_x - wp[0]) ** 2 + (robot_y - wp[1]) ** 2) ** 0.5
                 if dist_to_wp > self.lookahead:
                     break
                 self._current_waypoint_idx += 1
+                advanced = True
 
+            # Clear replan cooldown when we advance to a new waypoint
+            if advanced:
+                self._replan_attempted = False
+
+            # Check perpendicular deviation — trigger replan if needed
+            if self._should_replan(robot_x, robot_y):
+                self._replan_attempted = True
+                if not self.plan_path(np.array([robot_x, robot_y])):
+                    # Replan failed — path is now empty, fall through to fallback
+                    self._path = []
+
+        # --- Phase 2: steering from current path state ---
+        if self._path and self._current_waypoint_idx < len(self._path):
+            self._using_fallback = False
             target = self._path[self._current_waypoint_idx]
             dx = target[0] - robot_x
             dy = target[1] - robot_y
-
-            # Check if we've deviated too far from path — trigger replan
-            dist_to_target = (dx ** 2 + dy ** 2) ** 0.5
-            if dist_to_target > self.replan_deviation:
-                self.plan_path(np.array([robot_x, robot_y]))
 
             # Angle error
             desired_heading = atan2(dy, dx)
@@ -1439,6 +1497,11 @@ class AutoPilot:
 
         else:
             # Fallback: proportional control toward goal
+            if not self._using_fallback:
+                self._using_fallback = True
+                self._fallback_triggered = True
+                self._fallback_origin = (float(robot_x), float(robot_y))
+
             distance_to_goal = obs[7]
             angle_to_goal = obs[8]
 
@@ -1456,9 +1519,14 @@ class AutoPilot:
         return float(linear_vel), float(angular_vel)
 
     def reset(self):
-        """Clear cached path for new episode."""
+        """Clear cached path and state for new episode."""
         self._path = []
         self._current_waypoint_idx = 0
+        self._replan_attempted = False
+        self._cached_occ_grid = None
+        self._using_fallback = False
+        self._fallback_triggered = False
+        self._fallback_origin = None
 
 
 class LidarSensor:
@@ -1653,7 +1721,10 @@ class JetbotKeyboardController:
                  use_lidar: bool = False, arena_size: float = 4.0,
                  max_steps: int = 500, draw_lines: bool = False,
                  min_goal_dist: float = 0.5,
-                 inflation_radius: float = 0.08):
+                 inflation_radius: float = 0.08,
+                 noise_linear: float = 0.02,
+                 noise_angular: float = 0.1,
+                 lookahead: float = 0.2):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -1819,6 +1890,9 @@ class JetbotKeyboardController:
             max_angular_vel=self.MAX_ANGULAR_VELOCITY,
             scene_manager=self.scene_manager,
             robot_radius=inflation_radius,
+            noise_linear=noise_linear,
+            noise_angular=noise_angular,
+            lookahead=lookahead,
         ) if automatic else None
         self.auto_episode_count = 0
         self.auto_step_count = 0
@@ -2401,6 +2475,15 @@ class JetbotKeyboardController:
                             self.current_linear_vel = linear_vel
                             self.current_angular_vel = angular_vel
 
+                            # Draw cyan fallback line when A* fails mid-episode
+                            if self.auto_pilot._fallback_triggered and self._debug_draw is not None:
+                                origin = self.auto_pilot._fallback_origin
+                                goal = self.scene_manager.get_goal_position()
+                                z = 0.02
+                                points = [(origin[0], origin[1], z), (float(goal[0]), float(goal[1]), z)]
+                                self._debug_draw.draw_lines_spline(points, (0.0, 1.0, 1.0, 1.0), 3.0, False)
+                                self.auto_pilot._fallback_triggered = False
+
                         # Apply current velocity control
                         self._apply_control()
 
@@ -2565,6 +2648,18 @@ def parse_args():
         '--inflation-radius', type=float, default=0.08,
         help='Obstacle inflation radius for A* planner in meters (default: 0.08)'
     )
+    parser.add_argument(
+        '--noise-linear', type=float, default=0.02,
+        help='Gaussian noise std dev for linear velocity in autopilot (default: 0.02)'
+    )
+    parser.add_argument(
+        '--noise-angular', type=float, default=0.1,
+        help='Gaussian noise std dev for angular velocity in autopilot (default: 0.1)'
+    )
+    parser.add_argument(
+        '--lookahead', type=float, default=0.2,
+        help='Pure pursuit lookahead distance in meters (default: 0.2)'
+    )
     args = parser.parse_args()
 
     # Validate --min-goal against --arena-size
@@ -2584,6 +2679,15 @@ def parse_args():
             f"--inflation-radius ({args.inflation_radius:.2f}) must be less than "
             f"half the arena size ({half:.2f}m) for --arena-size {args.arena_size}"
         )
+    for flag in ('noise_linear', 'noise_angular', 'lookahead'):
+        if getattr(args, flag) != parser.get_default(flag) and not args.automatic:
+            parser.error(f"--{flag.replace('_', '-')} requires --automatic")
+    if args.noise_linear < 0:
+        parser.error("--noise-linear must be non-negative")
+    if args.noise_angular < 0:
+        parser.error("--noise-angular must be non-negative")
+    if args.lookahead <= 0:
+        parser.error("--lookahead must be positive")
 
     return args
 
@@ -2607,5 +2711,8 @@ if __name__ == "__main__":
         draw_lines=args.draw_lines,
         min_goal_dist=args.min_goal,
         inflation_radius=args.inflation_radius,
+        noise_linear=args.noise_linear,
+        noise_angular=args.noise_angular,
+        lookahead=args.lookahead,
     )
     controller.run()
