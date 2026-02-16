@@ -233,6 +233,69 @@ def inject_layernorm_into_critics(model):
     print("LayerNorm injected into critic networks")
 
 
+def bc_warmstart_sac(model, demo_obs, demo_actions, epochs=50, batch_size=256, lr=1e-3):
+    """Pretrain SAC/TQC actor on demo actions via behavioral cloning.
+
+    Only trains latent_pi (hidden layers) and mu (mean output) — leaves log_std
+    untouched so SAC's entropy tuning can adjust exploration post-BC.
+
+    Args:
+        model: SB3 SAC or TQC model
+        demo_obs: numpy array of demo observations
+        demo_actions: numpy array of demo actions (normalized to [-1, 1])
+        epochs: Number of BC epochs
+        batch_size: BC mini-batch size
+        lr: Learning rate for BC optimizer
+    """
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+
+    print("\n" + "=" * 60)
+    print("BC Warmstart (SAC/TQC Actor)")
+    print("=" * 60)
+
+    dataset = TensorDataset(
+        torch.tensor(demo_obs, dtype=torch.float32),
+        torch.tensor(demo_actions, dtype=torch.float32),
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Only optimize actor mean path (not log_std)
+    actor_params = (
+        list(model.actor.latent_pi.parameters())
+        + list(model.actor.mu.parameters())
+    )
+    optimizer = torch.optim.Adam(actor_params, lr=lr)
+    loss_fn = torch.nn.MSELoss()
+    device = model.device
+
+    print(f"  Pretraining actor for {epochs} epochs on {len(dataset)} transitions...")
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+        n_batches = 0
+        for obs_batch, act_batch in loader:
+            obs_batch = obs_batch.to(device)
+            act_batch = act_batch.to(device)
+
+            mean_actions, _, _ = model.actor.get_action_dist_params(obs_batch)
+            pred_actions = torch.tanh(mean_actions)
+            loss = loss_fn(pred_actions, act_batch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"  Epoch {epoch+1:4d}/{epochs}, Loss: {total_loss / n_batches:.6f}")
+
+    print("BC warmstart complete!")
+    print("=" * 60 + "\n")
+
+
 class VerboseEpisodeCallback:
     """Prints episode stats and periodic step-rate info during training."""
 
@@ -386,6 +449,14 @@ Examples:
                         help='Random seed (default: 42)')
     parser.add_argument('--learning-starts', type=int, default=0,
                         help='Steps before training starts (default: 0, demos available immediately)')
+
+    # BC warmstart arguments
+    parser.add_argument('--bc-epochs', type=int, default=50,
+                        help='Number of BC pretraining epochs (default: 50)')
+    parser.add_argument('--bc-batch-size', type=int, default=256,
+                        help='BC pretraining batch size (default: 256)')
+    parser.add_argument('--bc-lr', type=float, default=1e-3,
+                        help='BC pretraining learning rate (default: 1e-3)')
 
     # Environment arguments
     parser.add_argument('--reward-mode', choices=['dense', 'sparse'], default='dense',
@@ -550,6 +621,16 @@ Examples:
     inject_layernorm_into_critics(model)
     print(f"  Model created in {_time.time() - _t0:.1f}s")
     print()
+
+    # BC warmstart on actor
+    bc_warmstart_sac(model, demo_obs, demo_actions,
+                     epochs=args.bc_epochs, batch_size=args.bc_batch_size, lr=args.bc_lr)
+
+    # Tighten exploration noise to preserve BC-learned behavior
+    # log_std is a Linear layer; zero weights + low bias → constant std ≈ 0.135
+    model.actor.log_std.weight.data.zero_()
+    model.actor.log_std.bias.data.fill_(-2.0)
+    print("Exploration noise tightened (log_std bias = -2.0, std ≈ 0.135)")
 
     # Create callbacks
     checkpoint_dir = Path(args.output).parent / "checkpoints"
