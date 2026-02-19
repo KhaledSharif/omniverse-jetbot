@@ -723,6 +723,79 @@ class TestDemoRecorder:
         assert recorder.episode_lengths[0] == 2
         assert recorder.episode_success[0] is True
 
+    def test_done_flag_true_on_collision(self):
+        """Done flag should be True when recording a collision step."""
+        from jetbot_keyboard_control import DemoRecorder
+        recorder = DemoRecorder(obs_dim=34, action_dim=2)
+        recorder.start_recording()
+
+        # Simulate normal steps (done=False)
+        for _ in range(3):
+            recorder.record_step(np.ones(34), np.ones(2), 0.1, False)
+
+        # Simulate collision step (done=True)
+        recorder.record_step(np.ones(34), np.ones(2), -10.0, True)
+        recorder.mark_episode_success(False)
+        recorder.finalize_episode()
+
+        assert recorder.dones[0] is False
+        assert recorder.dones[1] is False
+        assert recorder.dones[2] is False
+        assert recorder.dones[3] is True  # collision terminal
+
+    def test_reward_includes_collision_penalty(self):
+        """RewardComputer should return collision penalty when info has collision=True."""
+        from jetbot_keyboard_control import RewardComputer
+        rc = RewardComputer(mode='dense')
+
+        obs = np.zeros(34)
+        next_obs = np.zeros(34)
+        info_collision = {'goal_reached': False, 'collision': True, 'min_lidar_distance': 0.05}
+        info_no_collision = {'goal_reached': False, 'collision': False, 'min_lidar_distance': 1.0}
+
+        reward_collision = rc.compute(obs, np.zeros(2), next_obs, info_collision)
+        reward_normal = rc.compute(obs, np.zeros(2), next_obs, info_no_collision)
+
+        assert reward_collision == -10.0, f"Collision should give -10.0, got {reward_collision}"
+        assert reward_normal != -10.0, "Normal step should not give -10.0"
+
+    def test_reward_includes_proximity_penalty(self):
+        """RewardComputer should apply proximity penalty when min_lidar_distance is small."""
+        from jetbot_keyboard_control import RewardComputer
+        rc = RewardComputer(mode='dense')
+
+        obs = np.zeros(34)
+        obs[7] = 1.0  # distance to goal
+        next_obs = np.zeros(34)
+        next_obs[7] = 1.0
+
+        # Close to obstacle (should have proximity penalty)
+        info_close = {'goal_reached': False, 'collision': False, 'min_lidar_distance': 0.15}
+        reward_close = rc.compute(obs, np.zeros(2), next_obs, info_close)
+
+        # Far from obstacle (no proximity penalty)
+        info_far = {'goal_reached': False, 'collision': False, 'min_lidar_distance': 1.0}
+        reward_far = rc.compute(obs, np.zeros(2), next_obs, info_far)
+
+        assert reward_close < reward_far, "Close to obstacle should have worse reward"
+
+    def test_done_flag_false_on_timeout(self):
+        """Done should NOT be True for timeout — timeout is truncation, not termination."""
+        from jetbot_keyboard_control import DemoRecorder
+        recorder = DemoRecorder(obs_dim=34, action_dim=2)
+        recorder.start_recording()
+
+        # Simulate a full episode of normal steps (timeout)
+        for _ in range(5):
+            recorder.record_step(np.ones(34), np.ones(2), -0.005, False)
+
+        # Finalize as failure (timeout) — note all dones should be False
+        recorder.mark_episode_success(False)
+        recorder.finalize_episode()
+
+        for i in range(5):
+            assert recorder.dones[i] is False, f"Step {i} done should be False for timeout"
+
 
 # ============================================================================
 # TEST SUITE: SceneManager

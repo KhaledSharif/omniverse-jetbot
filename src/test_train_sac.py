@@ -179,6 +179,52 @@ class TestLoadDemoTransitions:
         np.testing.assert_array_equal(next_obs[4], obs[4])
         np.testing.assert_array_equal(next_obs[9], obs[9])
 
+    def test_uses_recorded_dones(self, tmp_path):
+        """When NPZ has dones field, use recorded dones instead of blanket episode-end."""
+        path = tmp_path / "demo.npz"
+        num_ep = 2
+        steps = 5
+        total = num_ep * steps
+        obs_data = np.random.randn(total, 2).astype(np.float32)
+        dones_data = np.zeros(total, dtype=bool)
+        # Episode 1: collision at step 3 (index 2), episode ends at index 4
+        dones_data[2] = True   # mid-episode collision
+        dones_data[4] = True   # episode boundary
+        # Episode 2: timeout (no true terminal), episode ends at index 9
+        # dones_data[9] stays False — will be set to 1.0 by fallback
+        np.savez(path,
+                 observations=obs_data,
+                 actions=np.zeros((total, 2), dtype=np.float32),
+                 rewards=np.zeros(total, dtype=np.float32),
+                 dones=dones_data,
+                 episode_lengths=np.full(num_ep, steps))
+        _, _, _, _, dones = load_demo_transitions(str(path))
+        # Mid-episode collision should be preserved
+        assert dones[2] == 1.0, "Collision done should be preserved from NPZ"
+        assert dones[4] == 1.0, "Episode-end done should be preserved from NPZ"
+        # Timeout fallback: last step of ep2 should be 1.0
+        assert dones[9] == 1.0, "Timeout episode should fallback to done=1.0"
+        # Non-terminal steps should be 0.0
+        assert dones[0] == 0.0
+        assert dones[1] == 0.0
+        assert dones[5] == 0.0
+
+    def test_legacy_npz_without_dones_key(self, tmp_path):
+        """Legacy NPZ files without dones key should still load correctly."""
+        path = tmp_path / "demo.npz"
+        total = 10
+        np.savez(path,
+                 observations=np.random.randn(total, 2).astype(np.float32),
+                 actions=np.zeros((total, 2), dtype=np.float32),
+                 rewards=np.zeros(total, dtype=np.float32),
+                 episode_lengths=np.array([5, 5]))
+        _, _, _, _, dones = load_demo_transitions(str(path))
+        # Should fallback to done=1.0 at episode boundaries
+        assert dones[4] == 1.0
+        assert dones[9] == 1.0
+        assert dones[0] == 0.0
+        assert dones[3] == 0.0
+
 
 # ============================================================================
 # TEST SUITE: InjectLayernormIntoCritics

@@ -414,6 +414,7 @@ class SceneManager:
         self.goal_counter = 0
         self.obstacles = []
         self.obstacle_metadata = []  # List of (position_2d, effective_radius) tuples
+        self._obstacle_initial_dims = []  # List of (radius, height) at creation time
         self.obstacle_counter = 0
         self.num_obstacles = num_obstacles
         self.min_goal_dist = min_goal_dist
@@ -628,6 +629,7 @@ class SceneManager:
                         )
                     )
                     self.obstacles.append(obstacle)
+                    self._obstacle_initial_dims.append((radius, height))
                     pos_2d = np.array(position[:2], dtype=np.float32)
                     self.obstacle_metadata.append((pos_2d, radius))
 
@@ -635,14 +637,19 @@ class SceneManager:
                 pass
             self._obstacles_spawned = True
         else:
-            # Subsequent calls: reposition existing prims
-            for obstacle in self.obstacles:
+            # Subsequent calls: reposition and rescale existing prims
+            for idx, obstacle in enumerate(self.obstacles):
                 position = self._generate_safe_position()
                 radius = np.random.uniform(0.08, 0.15)
                 height = np.random.uniform(0.2, 0.5)
                 obstacle.set_world_pose(
                     position=np.array(position) + np.array([0, 0, height / 2])
                 )
+                # Update visual scale to match new radius/height
+                orig_r, orig_h = self._obstacle_initial_dims[idx]
+                obstacle.set_local_scale(np.array([
+                    radius / orig_r, radius / orig_r, height / orig_h
+                ]))
                 pos_2d = np.array(position[:2], dtype=np.float32)
                 self.obstacle_metadata.append((pos_2d, radius))
 
@@ -2059,19 +2066,29 @@ class JetbotKeyboardController:
         position, _ = self._get_robot_pose()
         goal_reached = self.scene_manager.check_goal_reached(position)
 
+        # Collision detection via LiDAR (matches JetbotNavigationEnv.step)
+        collision = False
+        min_lidar_distance = float('inf')
+        if next_obs is not None and len(next_obs) > 10:
+            lidar_readings = next_obs[10:]
+            min_lidar_distance = float(lidar_readings.min()) * self.lidar_sensor.max_range
+            collision = min_lidar_distance < 0.08  # COLLISION_THRESHOLD
+
         info = {
-            'goal_reached': goal_reached
+            'goal_reached': goal_reached,
+            'collision': collision,
+            'min_lidar_distance': min_lidar_distance,
         }
 
-        # Compute reward
+        # Compute reward (now includes collision penalty + proximity penalty)
         reward = 0.0
         if self.reward_computer is not None and self.current_obs is not None:
             reward = self.reward_computer.compute(
                 self.current_obs, action, next_obs, info
             )
 
-        # Record step
-        done = goal_reached
+        # done = true MDP terminal only (goal/collision/OOB); timeout is truncation
+        done = goal_reached or collision or self._is_out_of_bounds(position)
         self.recorder.record_step(self.current_obs, action, reward, done)
 
         # Update state

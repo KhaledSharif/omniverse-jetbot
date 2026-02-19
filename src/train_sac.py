@@ -86,6 +86,14 @@ def validate_demo_data(filepath: str) -> dict:
 def load_demo_transitions(npz_path: str):
     """Load demo data and reconstruct (obs, action, reward, next_obs, done) tuples.
 
+    Uses the recorded ``dones`` from the NPZ file, which mark true MDP terminals
+    (goal reached, collision, out-of-bounds) but NOT timeouts (truncations).
+    This ensures correct Q-learning bootstrapping: ``Q_target = r + gamma * (1 - done) * Q(s', a')``.
+
+    For backward compatibility with legacy NPZ files where ``dones`` only reflected
+    ``goal_reached``, the last step of each episode falls back to ``done=1.0`` if
+    no terminal was recorded.
+
     Args:
         npz_path: Path to .npz demo file
 
@@ -97,6 +105,7 @@ def load_demo_transitions(npz_path: str):
     actions = data['actions'].astype(np.float32)
     rewards = data['rewards'].astype(np.float32)
     episode_lengths = data['episode_lengths']
+    raw_dones = data['dones'].astype(np.float32) if 'dones' in data else np.zeros(len(observations), dtype=np.float32)
 
     total = len(observations)
     next_obs = np.zeros_like(observations)
@@ -109,7 +118,14 @@ def load_demo_transitions(npz_path: str):
             next_obs[offset + t] = observations[offset + t + 1]
         # Terminal step: next_obs doesn't matter (masked by done=True)
         next_obs[offset + length - 1] = observations[offset + length - 1]
-        dones[offset + length - 1] = 1.0
+
+        # Use recorded dones (true MDP terminals only)
+        dones[offset:offset + length] = raw_dones[offset:offset + length]
+
+        # Fallback for legacy files: ensure last step has done=True
+        if dones[offset + length - 1] == 0.0:
+            dones[offset + length - 1] = 1.0
+
         offset += length
 
     print(f"Loaded {len(episode_lengths)} demo episodes, {total} transitions")
