@@ -37,6 +37,13 @@ from jetbot_keyboard_control import (
     RewardComputer,
     SceneManager,
 )
+from jetbot_config import (
+    WHEEL_RADIUS, WHEEL_BASE,
+    MAX_LINEAR_VELOCITY, MAX_ANGULAR_VELOCITY,
+    START_POSITION, START_ORIENTATION,
+    DEFAULT_WORKSPACE_BOUNDS,
+    quaternion_to_yaw,
+)
 
 
 class JetbotNavigationEnv(gymnasium.Env):
@@ -68,23 +75,14 @@ class JetbotNavigationEnv(gymnasium.Env):
 
     metadata = {'render_modes': ['human']}
 
-    # Action scaling factors (from continuous [-1, 1] to physical units)
-    MAX_LINEAR_VELOCITY = 0.3   # m/s
-    MAX_ANGULAR_VELOCITY = 1.0  # rad/s
-
-    # Jetbot physical parameters
-    WHEEL_RADIUS = 0.03    # meters
-    WHEEL_BASE = 0.1125    # meters
-
-    # Start position
-    START_POSITION = np.array([0.0, 0.0, 0.05])
-    START_ORIENTATION = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion (w, x, y, z)
-
-    # Workspace bounds
-    DEFAULT_WORKSPACE_BOUNDS = {
-        'x': [-2.0, 2.0],
-        'y': [-2.0, 2.0],
-    }
+    # Re-export from jetbot_config for backwards compatibility
+    MAX_LINEAR_VELOCITY = MAX_LINEAR_VELOCITY
+    MAX_ANGULAR_VELOCITY = MAX_ANGULAR_VELOCITY
+    WHEEL_RADIUS = WHEEL_RADIUS
+    WHEEL_BASE = WHEEL_BASE
+    START_POSITION = START_POSITION
+    START_ORIENTATION = START_ORIENTATION
+    DEFAULT_WORKSPACE_BOUNDS = DEFAULT_WORKSPACE_BOUNDS
 
     # LiDAR configuration
     NUM_LIDAR_RAYS = 24
@@ -280,13 +278,7 @@ class JetbotNavigationEnv(gymnasium.Env):
             Tuple of (position, heading) where position is [x, y, z] and heading is radians
         """
         position, orientation = self.jetbot.get_world_pose()
-
-        # Convert quaternion to heading angle (yaw)
-        w, x, y, z = orientation
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
-        heading = np.arctan2(siny_cosp, cosy_cosp)
-
+        heading = quaternion_to_yaw(orientation)
         return position, heading
 
     def reset(self, seed=None, options=None):

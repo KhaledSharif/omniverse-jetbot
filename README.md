@@ -96,6 +96,8 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 isaac-sim-jetbot-keyboard/
 ├── src/
 │   ├── jetbot_keyboard_control.py    # Main teleoperation app
+│   ├── jetbot_config.py              # Shared robot constants & quaternion_to_yaw()
+│   ├── demo_utils.py                 # Shared demo loading/validation & VerboseEpisodeCallback
 │   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment
 │   ├── train_rl.py                   # PPO training script

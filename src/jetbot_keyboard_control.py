@@ -44,6 +44,13 @@ except ImportError:
     termios = None  # Windows — terminal echo control not needed
 from math import ceil, atan2, pi
 from pynput import keyboard
+from jetbot_config import (
+    WHEEL_RADIUS, WHEEL_BASE,
+    MAX_LINEAR_VELOCITY, MAX_ANGULAR_VELOCITY,
+    START_POSITION, START_ORIENTATION,
+    DEFAULT_WORKSPACE_BOUNDS,
+    quaternion_to_yaw,
+)
 
 # Isaac Sim imports must happen AFTER SimulationApp is created
 # They will be imported inside __init__ after app initialization
@@ -390,10 +397,7 @@ class SceneManager:
         workspace_bounds: Dict defining the workspace boundaries
     """
 
-    DEFAULT_WORKSPACE_BOUNDS = {
-        'x': [-2.0, 2.0],
-        'y': [-2.0, 2.0],
-    }
+    DEFAULT_WORKSPACE_BOUNDS = DEFAULT_WORKSPACE_BOUNDS
 
     def __init__(self, world, workspace_bounds: dict = None, num_obstacles: int = 5,
                  min_goal_dist: float = 0.5, robot_radius: float = 0.08):
@@ -1729,17 +1733,13 @@ class DemoPlayer:
 class JetbotKeyboardController:
     """Controller for Jetbot robot with keyboard input via pynput and Rich TUI."""
 
-    # Control parameters
-    MAX_LINEAR_VELOCITY = 0.3   # m/s
-    MAX_ANGULAR_VELOCITY = 1.0  # rad/s
-
-    # Jetbot physical parameters
-    WHEEL_RADIUS = 0.03    # meters
-    WHEEL_BASE = 0.1125    # meters (distance between wheels)
-
-    # Start position
-    START_POSITION = np.array([0.0, 0.0, 0.05])
-    START_ORIENTATION = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion (w, x, y, z)
+    # Re-export from jetbot_config for backwards compatibility
+    MAX_LINEAR_VELOCITY = MAX_LINEAR_VELOCITY
+    MAX_ANGULAR_VELOCITY = MAX_ANGULAR_VELOCITY
+    WHEEL_RADIUS = WHEEL_RADIUS
+    WHEEL_BASE = WHEEL_BASE
+    START_POSITION = START_POSITION
+    START_ORIENTATION = START_ORIENTATION
 
     def __init__(self, enable_recording: bool = False, demo_path: str = None,
                  reward_mode: str = "dense", num_obstacles: int = 5,
@@ -2020,15 +2020,7 @@ class JetbotKeyboardController:
             Tuple of (position, heading) where position is [x, y, z] and heading is radians
         """
         position, orientation = self.jetbot.get_world_pose()
-
-        # Convert quaternion to heading angle (yaw)
-        # Quaternion is [w, x, y, z]
-        w, x, y, z = orientation
-        # Yaw from quaternion
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
-        heading = np.arctan2(siny_cosp, cosy_cosp)
-
+        heading = quaternion_to_yaw(orientation)
         return position, heading
 
     def _build_current_observation(self) -> np.ndarray:

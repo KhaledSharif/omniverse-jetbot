@@ -42,6 +42,10 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - `train_bc.py` - Behavioral cloning from demonstrations
    - `replay.py` - Demo playback and inspection
 
+6. **Shared Modules**
+   - `jetbot_config.py` - Single source of truth for robot physical constants (`WHEEL_RADIUS`, `WHEEL_BASE`, velocity limits, start pose, workspace bounds) and `quaternion_to_yaw()` utility
+   - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, and `VerboseEpisodeCallback`
+
 ### Key Classes
 
 - **TUIRenderer**: Rich-based terminal UI for robot state display
@@ -185,6 +189,8 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 isaac-sim-jetbot-keyboard/
 ├── src/
 │   ├── jetbot_keyboard_control.py    # Main teleoperation app
+│   ├── jetbot_config.py              # Shared robot constants & quaternion_to_yaw()
+│   ├── demo_utils.py                 # Shared demo loading/validation & VerboseEpisodeCallback
 │   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment
 │   ├── train_rl.py                   # PPO training script

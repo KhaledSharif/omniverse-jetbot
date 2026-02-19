@@ -12,6 +12,12 @@ import argparse
 import numpy as np
 import time
 
+from jetbot_config import (
+    WHEEL_RADIUS, WHEEL_BASE,
+    MAX_LINEAR_VELOCITY, MAX_ANGULAR_VELOCITY,
+    START_POSITION,
+)
+
 
 def show_info(filepath: str):
     """Display demonstration statistics without loading Isaac Sim."""
@@ -108,7 +114,7 @@ def visual_playback(filepath: str, episode_idx: int = None, speed: float = 1.0,
             wheel_dof_names=["left_wheel_joint", "right_wheel_joint"],
             create_robot=True,
             usd_path=assets_root + "/Isaac/Robots/NVIDIA/Jetbot/jetbot.usd",
-            position=np.array([0.0, 0.0, 0.05])
+            position=START_POSITION,
         )
     )
     world.scene.add_default_ground_plane()
@@ -116,15 +122,11 @@ def visual_playback(filepath: str, episode_idx: int = None, speed: float = 1.0,
     # Create controller
     controller = DifferentialController(
         name="replay_controller",
-        wheel_radius=0.03,
-        wheel_base=0.1125
+        wheel_radius=WHEEL_RADIUS,
+        wheel_base=WHEEL_BASE,
     )
 
     world.reset()
-
-    # Action scaling (same as in jetbot_keyboard_control.py)
-    MAX_LINEAR_VELOCITY = 0.3
-    MAX_ANGULAR_VELOCITY = 1.0
 
     # Play each episode
     for ep_idx in episodes:

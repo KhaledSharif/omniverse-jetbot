@@ -15,48 +15,7 @@ import argparse
 import numpy as np
 from pathlib import Path
 
-
-def load_demo_data(filepath: str, successful_only: bool = False):
-    """Load demonstration data from NPZ file.
-
-    Args:
-        filepath: Path to .npz demo file
-        successful_only: If True, only load successful episodes
-
-    Returns:
-        Tuple of (observations, actions) numpy arrays
-    """
-    from jetbot_keyboard_control import DemoPlayer
-    player = DemoPlayer(filepath)
-
-    print(f"Loaded {player.num_episodes} episodes, {player.total_frames} frames")
-
-    # Filter to successful only if requested
-    if successful_only:
-        episodes = player.get_successful_episodes()
-        print(f"Using {len(episodes)} successful episodes")
-    else:
-        episodes = list(range(player.num_episodes))
-
-    if len(episodes) == 0:
-        raise ValueError("No episodes to train on!")
-
-    # Collect data for training
-    observations = []
-    actions = []
-    for ep_idx in episodes:
-        obs, acts = player.get_episode(ep_idx)
-        observations.append(obs)
-        actions.append(acts)
-
-    observations = np.vstack(observations)
-    actions = np.vstack(actions)
-
-    print(f"Training data: {len(observations)} transitions")
-    print(f"Observation shape: {observations.shape}")
-    print(f"Action shape: {actions.shape}")
-
-    return observations, actions
+from demo_utils import load_demo_data
 
 
 def train_simple_pytorch(observations, actions, args):
