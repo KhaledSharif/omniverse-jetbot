@@ -637,21 +637,16 @@ class SceneManager:
                 pass
             self._obstacles_spawned = True
         else:
-            # Subsequent calls: reposition and rescale existing prims
+            # Subsequent calls: reposition existing prims (keep original radius/height
+            # so visual prim and metadata stay consistent)
             for idx, obstacle in enumerate(self.obstacles):
                 position = self._generate_safe_position()
-                radius = np.random.uniform(0.08, 0.15)
-                height = np.random.uniform(0.2, 0.5)
-                obstacle.set_world_pose(
-                    position=np.array(position) + np.array([0, 0, height / 2])
-                )
-                # Update visual scale to match new radius/height
                 orig_r, orig_h = self._obstacle_initial_dims[idx]
-                obstacle.set_local_scale(np.array([
-                    radius / orig_r, radius / orig_r, height / orig_h
-                ]))
+                obstacle.set_world_pose(
+                    position=np.array(position) + np.array([0, 0, orig_h / 2])
+                )
                 pos_2d = np.array(position[:2], dtype=np.float32)
-                self.obstacle_metadata.append((pos_2d, radius))
+                self.obstacle_metadata.append((pos_2d, orig_r))
 
     def _generate_safe_goal_position(self) -> list:
         """Generate a goal position that is not too close to the robot start.
@@ -1234,7 +1229,8 @@ def astar_search(grid, start_world, goal_world):
 
     Returns:
         List of (world_x, world_y) waypoints from start to goal,
-        or [] if no path found.
+        or [] if no path found. The final waypoint is always the exact
+        goal_world position (not the snapped grid cell center).
     """
     sx, sy = grid.world_to_grid(start_world[0], start_world[1])
     gx, gy = grid.world_to_grid(goal_world[0], goal_world[1])
@@ -1279,7 +1275,15 @@ def astar_search(grid, start_world, goal_world):
                 node = came_from[node]
             path.append(grid.grid_to_world(sx, sy))
             path.reverse()
-            return _simplify_path(path)
+            path = _simplify_path(path)
+
+            # Always end at the exact goal position (not the snapped cell center)
+            # so the pure-pursuit controller drives all the way to the goal
+            goal_exact = (float(goal_world[0]), float(goal_world[1]))
+            if path and path[-1] != goal_exact:
+                path.append(goal_exact)
+
+            return path
 
         if g > g_score.get((cx, cy), float('inf')):
             continue
@@ -2071,7 +2075,7 @@ class JetbotKeyboardController:
         min_lidar_distance = float('inf')
         if next_obs is not None and len(next_obs) > 10:
             lidar_readings = next_obs[10:]
-            min_lidar_distance = float(lidar_readings.min()) * self.lidar_sensor.max_range
+            min_lidar_distance = float(lidar_readings.min()) * self.obs_builder.lidar_sensor.max_range
             collision = min_lidar_distance < 0.08  # COLLISION_THRESHOLD
 
         info = {
@@ -2640,6 +2644,10 @@ class JetbotKeyboardController:
                         elif self.headless_tui and self.automatic and self.auto_step_count % 100 == 0:
                             print(f"  Step {self.auto_step_count}, Episodes: {self.auto_episode_count}")
 
+        except Exception as e:
+            import traceback
+            print(f"\n[FATAL] Exception in main loop: {e}")
+            traceback.print_exc()
         finally:
             # Cleanup camera streaming
             if self.camera_streamer is not None:
