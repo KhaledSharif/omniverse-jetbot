@@ -1089,7 +1089,8 @@ Examples:
     else:
         demo_obs_step, demo_actions_step, demo_rewards_step, _, demo_dones_step = \
             load_demo_transitions(args.demos)
-    demo_data = np.load(args.demos, allow_pickle=True)
+    from demo_io import open_demo
+    demo_data = open_demo(args.demos)
     episode_lengths = demo_data['episode_lengths']
 
     # Build chunk-level transitions (for replay buffer)

@@ -705,12 +705,15 @@ class DemoRecorder:
         is_recording: Whether recording is active
     """
 
-    def __init__(self, obs_dim: int, action_dim: int):
+    def __init__(self, obs_dim: int, action_dim: int, hdf5_path: str = None):
         """Initialize the DemoRecorder.
 
         Args:
             obs_dim: Dimension of the observation space
             action_dim: Dimension of the action space
+            hdf5_path: Optional path to HDF5 file for incremental writing.
+                When provided, checkpoint saves use O(delta) HDF5 appends
+                instead of O(N) NPZ rewrites.
         """
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -733,6 +736,12 @@ class DemoRecorder:
         self.current_episode_start = 0
         self.current_episode_return = 0.0
         self._pending_success = None
+
+        # HDF5 incremental writer
+        self._hdf5_writer = None
+        if hdf5_path is not None:
+            from demo_io import HDF5DemoWriter
+            self._hdf5_writer = HDF5DemoWriter(hdf5_path, obs_dim, action_dim)
 
     def start_recording(self) -> None:
         """Start recording a new episode."""
@@ -799,13 +808,18 @@ class DemoRecorder:
         steps recorded since the episode began. Used to skip unsolvable
         scenes without polluting the demo dataset.
         """
-        self.observations = self.observations[:self.current_episode_start]
-        self.actions = self.actions[:self.current_episode_start]
-        self.rewards = self.rewards[:self.current_episode_start]
-        self.dones = self.dones[:self.current_episode_start]
-        self.costs = self.costs[:self.current_episode_start]
+        target = self.current_episode_start
+        self.observations = self.observations[:target]
+        self.actions = self.actions[:target]
+        self.rewards = self.rewards[:target]
+        self.dones = self.dones[:target]
+        self.costs = self.costs[:target]
         self.current_episode_return = 0.0
         self._pending_success = None
+
+        # If HDF5 writer already flushed past the episode start, truncate on disk
+        if self._hdf5_writer is not None and self._hdf5_writer.step_cursor > target:
+            self._hdf5_writer.truncate_to(target)
 
     def get_stats(self) -> dict:
         """Get current recording statistics.
@@ -842,11 +856,18 @@ class DemoRecorder:
         self.current_episode_return = 0.0
         self._pending_success = None
 
+        if self._hdf5_writer is not None:
+            self._hdf5_writer.close()
+            self._hdf5_writer = None
+
     def save(self, filepath: str, metadata: dict = None, finalize_pending: bool = True) -> None:
-        """Save demonstrations to NPZ file.
+        """Save demonstrations to file.
+
+        When an HDF5 writer is active, only the delta since the last save is
+        written (O(delta)). Otherwise falls back to full NPZ rewrite (O(N)).
 
         Args:
-            filepath: Path to save the .npz file
+            filepath: Path to save the file (.npz or .hdf5)
             metadata: Optional dictionary of additional metadata
             finalize_pending: If True, auto-finalize any in-progress episode
                 before saving. Set to False for checkpoint saves to avoid
@@ -870,6 +891,45 @@ class DemoRecorder:
         if metadata:
             save_metadata.update(metadata)
 
+        # Add cost metadata if costs were recorded
+        if self.costs:
+            save_metadata['has_cost'] = True
+
+        # ---- HDF5 incremental path ----
+        if self._hdf5_writer is not None:
+            writer = self._hdf5_writer
+            step_cursor = writer.step_cursor
+            ep_cursor = writer.ep_cursor
+
+            # Append new steps since last flush
+            n_new = len(self.observations) - step_cursor
+            if n_new > 0:
+                writer.append_steps(
+                    np.array(self.observations[step_cursor:], dtype=np.float32),
+                    np.array(self.actions[step_cursor:], dtype=np.float32),
+                    np.array(self.rewards[step_cursor:], dtype=np.float32),
+                    np.array(self.dones[step_cursor:], dtype=bool),
+                    np.array(self.costs[step_cursor:], dtype=np.float32) if self.costs else np.zeros(n_new, dtype=np.float32),
+                )
+
+            # Append new episodes since last flush
+            for i in range(ep_cursor, len(self.episode_starts)):
+                writer.append_episode(
+                    self.episode_starts[i],
+                    self.episode_lengths[i],
+                    self.episode_returns[i],
+                    self.episode_success[i],
+                )
+
+            writer.set_metadata(save_metadata)
+            writer.flush()
+
+            if finalize_pending:
+                writer.close()
+                self._hdf5_writer = None
+            return
+
+        # ---- NPZ fallback path ----
         # Convert lists to arrays
         if self.observations:
             obs_array = np.array(self.observations)
@@ -877,10 +937,6 @@ class DemoRecorder:
         else:
             obs_array = np.array([]).reshape(0, self.obs_dim)
             action_array = np.array([]).reshape(0, self.action_dim)
-
-        # Add cost metadata if costs were recorded
-        if self.costs:
-            save_metadata['has_cost'] = True
 
         np.savez_compressed(
             filepath,
@@ -898,15 +954,17 @@ class DemoRecorder:
 
     @classmethod
     def load(cls, filepath: str) -> 'DemoRecorder':
-        """Load demonstrations from NPZ file.
+        """Load demonstrations from a demo file (.npz or .hdf5).
 
         Args:
-            filepath: Path to the .npz file
+            filepath: Path to the demo file
 
         Returns:
             DemoRecorder instance with loaded data
         """
-        data = np.load(filepath, allow_pickle=True)
+        from demo_io import open_demo
+
+        data = open_demo(filepath)
         metadata = data['metadata'].item()
 
         recorder = cls(
@@ -925,6 +983,15 @@ class DemoRecorder:
         recorder.episode_success = list(data['episode_success'])
 
         recorder.current_episode_start = len(recorder.observations)
+
+        data.close()
+
+        # Re-open HDF5 writer in append mode for resumed recording
+        if filepath.endswith(('.hdf5', '.h5')):
+            from demo_io import HDF5DemoWriter
+            recorder._hdf5_writer = HDF5DemoWriter(
+                filepath, recorder.obs_dim, recorder.action_dim
+            )
 
         return recorder
 
@@ -1722,18 +1789,21 @@ class DemoPlayer:
     """
 
     def __init__(self, filepath: str):
-        """Load demonstrations from NPZ file.
+        """Load demonstrations from a demo file (.npz or .hdf5).
 
         Args:
-            filepath: Path to the .npz file containing demonstrations
+            filepath: Path to the demo file containing demonstrations
         """
-        data = np.load(filepath, allow_pickle=True)
+        from demo_io import open_demo
+        data = open_demo(filepath)
 
-        self.observations = data['observations']
-        self.actions = data['actions']
-        self.episode_starts = data['episode_starts']
-        self.episode_lengths = data['episode_lengths']
-        self.episode_success = data['episode_success']
+        self.observations = np.asarray(data['observations'])
+        self.actions = np.asarray(data['actions'])
+        self.episode_starts = np.asarray(data['episode_starts'])
+        self.episode_lengths = np.asarray(data['episode_lengths'])
+        self.episode_success = np.asarray(data['episode_success'])
+
+        data.close()
 
         self.num_episodes = len(self.episode_starts)
         self.total_frames = len(self.observations)
@@ -1911,7 +1981,7 @@ class JetbotKeyboardController:
         if demo_path is None:
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            self.demo_save_path = f"demos/recording_{timestamp}.npz"
+            self.demo_save_path = f"demos/recording_{timestamp}.hdf5"
         else:
             self.demo_save_path = demo_path
 
@@ -2000,7 +2070,9 @@ class JetbotKeyboardController:
         self.obs_builder = ObservationBuilder(lidar_sensor=lidar)
 
         # Initialize demo recorder with correct obs dimension
-        self.recorder = DemoRecorder(obs_dim=self.obs_builder.obs_dim, action_dim=2)
+        hdf5_path = self.demo_save_path if self.demo_save_path.endswith(('.hdf5', '.h5')) else None
+        self.recorder = DemoRecorder(obs_dim=self.obs_builder.obs_dim, action_dim=2,
+                                     hdf5_path=hdf5_path)
 
         # Initialize reward computer
         self.reward_computer = RewardComputer(mode=self.reward_mode)

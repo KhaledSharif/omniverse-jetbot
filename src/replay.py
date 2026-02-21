@@ -21,7 +21,8 @@ from jetbot_config import (
 
 def show_info(filepath: str):
     """Display demonstration statistics without loading Isaac Sim."""
-    data = np.load(filepath, allow_pickle=True)
+    from demo_io import open_demo
+    data = open_demo(filepath)
 
     print(f"\n{'='*60}")
     print(f"Demo File: {filepath}")

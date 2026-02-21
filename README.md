@@ -8,7 +8,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 - **Rich Terminal UI**: Real-time robot state display with visual feedback
 - **Camera Streaming**: GStreamer H264 RTP UDP streaming from Jetbot camera
 - **Random Obstacles**: Configurable static obstacles for navigation challenge
-- **Demonstration Recording**: Record navigation trajectories for imitation learning
+- **Demonstration Recording**: Record navigation trajectories to HDF5 (incremental O(delta) checkpoints) or NPZ
 - **Automatic Demo Collection**: Autonomous A*-based data collection with collision-free expert controller
 - **RL Training Pipeline**: PPO with BC warmstart; SAC/TQC with Chunk CVAE + Q-Chunking
 - **SafeTQC**: Constrained RL with dual cost critic + learned Lagrange multiplier for obstacle avoidance
@@ -30,6 +30,14 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 ```bash
 ~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install numpy pynput rich stable-baselines3 tensorboard gymnasium
 ```
+
+### HDF5 Demo Recording (Recommended)
+
+```bash
+~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install h5py
+```
+
+HDF5 enables incremental O(delta) checkpoint saves during recording — checkpoint cost stays ~2ms regardless of dataset size, compared to 200-500ms+ for full NPZ rewrites. Falls back to NPZ automatically if `h5py` is not installed.
 
 ### Camera Streaming Dependencies (Optional)
 
@@ -69,10 +77,11 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 ### Train RL Agent (SAC/TQC + Chunk CVAE)
 
 ```bash
-./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 500000
+# Both .npz and .hdf5 demo files are accepted
+./run.sh train_sac.py --demos demos/recording.hdf5 --headless --timesteps 500000
 
 # With SafeTQC (constrained RL)
-./run.sh train_sac.py --demos demos/recording.npz --headless --safe
+./run.sh train_sac.py --demos demos/recording.hdf5 --headless --safe
 ```
 
 ## Controls
@@ -105,6 +114,7 @@ isaac-sim-jetbot-keyboard/
 │   ├── jetbot_keyboard_control.py    # Main teleoperation app
 │   ├── jetbot_config.py              # Shared robot constants & quaternion_to_yaw()
 │   ├── demo_utils.py                 # Shared demo loading/validation & VerboseEpisodeCallback
+│   ├── demo_io.py                    # Unified demo I/O: open_demo(), HDF5DemoWriter, NPZ↔HDF5 converter
 │   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment
 │   ├── train_rl.py                   # PPO training script
@@ -118,7 +128,8 @@ isaac-sim-jetbot-keyboard/
 │   ├── test_train_sac.py
 │   ├── test_train_bc.py
 │   ├── test_eval_policy.py
-│   └── test_replay.py
+│   ├── test_replay.py
+│   └── test_demo_io.py
 ├── demos/                            # Recorded demonstrations
 ├── models/                           # Trained models
 ├── runs/                             # TensorBoard logs
@@ -293,20 +304,32 @@ The VecNormalize pre-warming step is critical: without it, the BC-learned policy
 ./run.sh eval_policy.py models/tqc_jetbot.zip --chunk-size 5 --inflation-radius 0.08
 ```
 
+### Demo File Format
+
+New recordings default to **HDF5** (`.hdf5`). All tools accept both `.npz` and `.hdf5` transparently via `open_demo()`.
+
+```bash
+# Convert existing NPZ demos to HDF5
+python src/demo_io.py demos/recording.npz demos/recording.hdf5
+
+# Or let the output path default to same name with .hdf5 extension
+python src/demo_io.py demos/recording.npz
+```
+
 ### Demo Inspection
 
 ```bash
-# Show demo statistics (no simulation needed)
-./run.sh replay.py demos/recording.npz --info
+# Show demo statistics (no simulation needed) — works with .npz or .hdf5
+./run.sh replay.py demos/recording.hdf5 --info
 
 # Visual playback
-./run.sh replay.py demos/recording.npz
+./run.sh replay.py demos/recording.hdf5
 
 # Replay specific episode
-./run.sh replay.py demos/recording.npz --episode 0
+./run.sh replay.py demos/recording.hdf5 --episode 0
 
 # Replay successful episodes only
-./run.sh replay.py demos/recording.npz --successful
+./run.sh replay.py demos/recording.hdf5 --successful
 ```
 
 ### Testing
@@ -398,7 +421,8 @@ Additional optimizations applied in headless mode:
 - **ChunkCVAEFeatureExtractor**: Split state/lidar MLPs + z-pad slot for CVAE latent variable
 - **DifferentialController**: Converts velocity commands to wheel speeds
 - **SceneManager**: Manages goal markers, obstacles, and scene objects
-- **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations (with cost data for SafeTQC)
+- **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations; HDF5 incremental writes by default (with cost data for SafeTQC)
+- **demo_io**: Unified demo I/O — `open_demo()` dispatches `.npz`/`.hdf5`, `HDF5DemoWriter` for O(delta) appends
 - **SafeTQC**: TQC subclass with cost critic + Lagrange multiplier for constrained RL
 - **CostReplayBuffer**: Parallel cost buffer mirroring the main replay buffer
 - **MeanCostCritic**: Twin-Q cost critic with independent feature extractor

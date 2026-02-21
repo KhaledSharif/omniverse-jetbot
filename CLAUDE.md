@@ -53,13 +53,16 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 6. **Shared Modules**
    - `jetbot_config.py` - Single source of truth for robot physical constants (`WHEEL_RADIUS`, `WHEEL_BASE`, velocity limits, start pose, workspace bounds) and `quaternion_to_yaw()` utility
    - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, `extract_action_chunks()`, `make_chunk_transitions()`, and `VerboseEpisodeCallback`
+   - `demo_io.py` - Unified demo I/O adapter: `open_demo()` dispatches `.npz`/`.hdf5`, `HDF5DemoWriter` for O(delta) incremental recording, `convert_npz_to_hdf5()` migration utility
 
 ### Key Classes
 
 - **TUIRenderer**: Rich-based terminal UI for robot state display
 - **SceneManager**: Manages goal markers and scene objects
-- **DemoRecorder**: Records (obs, action, reward, done, cost) tuples to NPZ
-- **DemoPlayer**: Loads and replays recorded demonstrations
+- **DemoRecorder**: Records (obs, action, reward, done, cost) tuples; uses HDF5 incremental writes by default (O(delta) checkpoints), falls back to NPZ
+- **DemoPlayer**: Loads and replays recorded demonstrations (supports both `.npz` and `.hdf5`)
+- **open_demo()**: Unified reader dispatching on file extension — returns dict-like `NpzDemoData` or `Hdf5DemoData` (`src/demo_io.py`)
+- **HDF5DemoWriter**: Incremental HDF5 writer with resizable chunked datasets, O(delta) `append_steps()`/`flush()` (`src/demo_io.py`)
 - **ActionMapper**: Maps keyboard keys to velocity commands
 - **ObservationBuilder**: Builds observation vectors from robot state
 - **RewardComputer**: Computes navigation rewards; `compute_cost()` static method for SafeTQC cost signal; `safe_mode` suppresses proximity penalty
@@ -205,7 +208,14 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 
 # Tests
 ./run_tests.sh
+
+# Convert existing NPZ demos to HDF5
+python src/demo_io.py demos/recording.npz demos/recording.hdf5
 ```
+
+### Demo File Format
+
+New recordings default to **HDF5** (`.hdf5`) for O(delta) incremental checkpoint saves. All loading functions (`open_demo()`, `validate_demo_data()`, `load_demo_transitions()`, etc.) accept both `.npz` and `.hdf5` transparently. Old `.npz` files continue to work without conversion.
 
 ## File Structure
 
@@ -215,6 +225,7 @@ isaac-sim-jetbot-keyboard/
 │   ├── jetbot_keyboard_control.py    # Main teleoperation app
 │   ├── jetbot_config.py              # Shared robot constants & quaternion_to_yaw()
 │   ├── demo_utils.py                 # Shared demo loading/validation, chunk extraction & VerboseEpisodeCallback
+│   ├── demo_io.py                    # Unified demo I/O: open_demo(), HDF5DemoWriter, convert_npz_to_hdf5()
 │   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment + ChunkedEnvWrapper
 │   ├── train_rl.py                   # PPO training script
@@ -228,7 +239,8 @@ isaac-sim-jetbot-keyboard/
 │   ├── test_train_sac.py
 │   ├── test_train_bc.py
 │   ├── test_eval_policy.py
-│   └── test_replay.py
+│   ├── test_replay.py
+│   └── test_demo_io.py
 ├── demos/                            # Recorded demonstrations
 ├── models/                           # Trained models
 ├── runs/                             # TensorBoard logs
@@ -436,6 +448,9 @@ Per-test behaviour can still be customised by overriding the instance's `step` a
 Optional for camera streaming:
 - GStreamer 1.0 and plugins (gstreamer1.0-tools, gstreamer1.0-plugins-base/good/bad, gstreamer1.0-libav)
 - PyGObject (python3-gi)
+
+Optional for HDF5 demo recording (recommended):
+- h5py (incremental O(delta) demo checkpoints; falls back to NPZ without it)
 
 Optional for RL:
 - torch (PyTorch — bundled with Isaac Sim)

@@ -111,7 +111,8 @@ def compute_mc_returns(filepath: str, gamma: float = 0.99) -> np.ndarray:
     Returns:
         (N,) float32 array of MC returns for each transition
     """
-    data = np.load(filepath, allow_pickle=True)
+    from demo_io import open_demo
+    data = open_demo(filepath)
     rewards = data['rewards']
     episode_lengths = data['episode_lengths']
 
@@ -222,7 +223,8 @@ def prewarm_vecnormalize(env, demo_path: str, gamma: float = 0.99):
         demo_path: Path to demo .npz file
         gamma: Discount factor (must match PPO gamma)
     """
-    data = np.load(demo_path, allow_pickle=True)
+    from demo_io import open_demo
+    data = open_demo(demo_path)
     observations = data['observations'].astype(np.float32)
     rewards = data['rewards'].astype(np.float32)
     episode_lengths = data['episode_lengths']

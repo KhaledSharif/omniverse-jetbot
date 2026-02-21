@@ -4,13 +4,14 @@ Used by train_rl.py, train_sac.py, and train_bc.py to avoid duplication.
 """
 
 import numpy as np
+from demo_io import open_demo
 
 
 def validate_demo_data(filepath: str, require_cost: bool = False) -> dict:
     """Validate demonstration data meets minimum requirements for training.
 
     Args:
-        filepath: Path to .npz demo file
+        filepath: Path to demo file (.npz or .hdf5)
         require_cost: If True, require cost data (has_cost metadata + costs array)
 
     Returns:
@@ -19,7 +20,7 @@ def validate_demo_data(filepath: str, require_cost: bool = False) -> dict:
     Raises:
         ValueError: If data doesn't meet minimum requirements
     """
-    data = np.load(filepath, allow_pickle=True)
+    data = open_demo(filepath)
 
     episode_lengths = data['episode_lengths']
     num_episodes = len(episode_lengths)
@@ -140,7 +141,7 @@ def load_demo_transitions(npz_path: str, load_costs: bool = False):
         5-tuple of (obs, actions, rewards, next_obs, dones) numpy arrays, or
         6-tuple adding costs when load_costs=True
     """
-    data = np.load(npz_path, allow_pickle=True)
+    data = open_demo(npz_path)
     observations = data['observations'].astype(np.float32)
     actions = data['actions'].astype(np.float32)
     rewards = data['rewards'].astype(np.float32)
