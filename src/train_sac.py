@@ -875,6 +875,378 @@ def _create_safe_tqc_class(tqc_base_cls):
     return SafeTQC
 
 
+def _create_dual_policy_class(base_cls):
+    """Create DualPolicyTQC class dynamically (IBRL: frozen IL anchor + RL actor).
+
+    After CVAE pretraining, a frozen copy of the actor is kept as an immutable
+    IL anchor. At every env step, both the frozen IL policy and the RL policy
+    propose actions; the one with the higher Q-value is executed. TD targets
+    also use max(Q_IL, Q_RL_entropy_adjusted) to accelerate critic learning.
+
+    Args:
+        base_cls: The TQC or SAC class to subclass
+
+    Returns:
+        DualPolicyTQC class
+    """
+    import copy
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+    from stable_baselines3.common.utils import obs_as_tensor, polyak_update
+
+    class DualPolicyTQC(base_cls):
+        """TQC/SAC with IBRL dual-policy: frozen IL anchor + RL actor.
+
+        The IL actor is frozen after CVAE pretraining. At each env step, both
+        actors propose actions; the one with higher Q wins. TD targets use
+        max(Q_IL, Q_RL_entropy_adjusted) to accelerate critic bootstrap.
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.il_actor = None
+            self.il_noise_std = 0.1
+            self.il_soft = False
+            self.il_beta = 10.0
+
+        def _ibrl_min_q(self, obs_tensor, action_tensor):
+            """Compute min-over-critics Q-value estimate for (obs, action) pair.
+
+            Args:
+                obs_tensor: (batch, obs_dim) tensor on device
+                action_tensor: (batch, action_dim) tensor on device
+
+            Returns:
+                (batch,) Q-value tensor
+            """
+            _qc = _get_tqc_quantile_critics(self.critic)
+            if _qc is not None:
+                # TQC path: extract features once, run each quantile critic
+                features = self.critic.features_extractor(obs_tensor)
+                x = torch.cat([features, action_tensor], dim=-1)
+                q_per_net = []
+                for critic_net in _qc:
+                    q_quantiles = critic_net(x)  # (batch, n_quantiles)
+                    q_per_net.append(q_quantiles.mean(dim=1))  # (batch,)
+                q_stack = torch.stack(q_per_net, dim=1)  # (batch, n_critics)
+                return q_stack.min(dim=1).values  # (batch,)
+            else:
+                # SAC path: use critic forward()
+                q_raw = self.critic(obs_tensor, action_tensor)
+                if isinstance(q_raw, (list, tuple)):
+                    q_cat = torch.cat(q_raw, dim=1)  # (batch, n_critics)
+                    return q_cat.min(dim=1).values
+                elif q_raw.dim() == 3:
+                    # TQC stacked (batch, n_critics, n_quantiles)
+                    return q_raw.mean(dim=2).min(dim=1).values
+                else:
+                    return q_raw.squeeze(1)
+
+        def _sample_action(self, learning_starts, action_noise=None, n_envs=1):
+            if self.il_actor is None or self.num_timesteps < learning_starts:
+                return super()._sample_action(
+                    learning_starts, action_noise=action_noise, n_envs=n_envs
+                )
+
+            self.policy.set_training_mode(False)
+            obs_tensor = obs_as_tensor(self._last_obs, self.device)
+
+            with torch.no_grad():
+                a_rl = self.actor._predict(obs_tensor, deterministic=False)
+                if self.il_noise_std > 0:
+                    a_rl = torch.clamp(
+                        a_rl + torch.randn_like(a_rl) * self.il_noise_std,
+                        -1.0, 1.0,
+                    )
+
+                a_il = self.il_actor._predict(obs_tensor, deterministic=True)
+
+                q_rl = self._ibrl_min_q(obs_tensor, a_rl)   # (batch,)
+                q_il = self._ibrl_min_q(obs_tensor, a_il)   # (batch,)
+
+                if self.il_soft:
+                    q_stack = torch.stack([q_rl, q_il], dim=1) * self.il_beta
+                    probs = torch.softmax(q_stack, dim=1)
+                    choices = torch.multinomial(probs, 1).squeeze(1)  # (batch,)
+                    chosen = torch.where(
+                        choices.bool().unsqueeze(-1), a_il, a_rl
+                    )
+                else:
+                    chosen = torch.where(
+                        (q_il > q_rl).unsqueeze(-1), a_il, a_rl
+                    )
+
+            buffer_action_np = chosen.cpu().numpy()
+            action_np = self.policy.unscale_action(buffer_action_np)
+            # action_noise arg intentionally ignored; IBRL noise replaces it
+            return action_np, buffer_action_np
+
+        def train(self, gradient_steps, batch_size=64):
+            if self.il_actor is None:
+                super().train(gradient_steps, batch_size)
+                return
+
+            # Switch to train mode
+            self.policy.set_training_mode(True)
+
+            # Update learning rate
+            self._update_learning_rate(
+                [self.actor.optimizer, self.critic.optimizer]
+            )
+
+            ent_coef_losses, ent_coefs = [], []
+            actor_losses, critic_losses = [], []
+            il_selection_rates = []
+
+            for _ in range(gradient_steps):
+                # Sample replay buffer
+                replay_data = self.replay_buffer.sample(
+                    batch_size, env=self._vec_normalize_env
+                )
+
+                # --- Entropy coefficient update ---
+                actions_pi, log_prob = self.actor.action_log_prob(
+                    replay_data.observations
+                )
+                log_prob = log_prob.reshape(-1, 1)
+
+                ent_coef = torch.exp(self.log_ent_coef.detach())
+                ent_coef_loss = -(
+                    self.log_ent_coef * (log_prob + self.target_entropy).detach()
+                ).mean()
+                ent_coef_losses.append(ent_coef_loss.item())
+
+                self.ent_coef_optimizer.zero_grad()
+                ent_coef_loss.backward()
+                self.ent_coef_optimizer.step()
+
+                ent_coefs.append(ent_coef.item())
+
+                # --- IBRL TD target ---
+                with torch.no_grad():
+                    next_obs = replay_data.next_observations
+                    B = next_obs.shape[0]
+
+                    # RL next action + log prob
+                    next_actions_rl, next_log_prob_rl = self.actor.action_log_prob(
+                        next_obs
+                    )
+                    next_log_prob_rl = next_log_prob_rl.reshape(-1, 1)
+
+                    # IL next action (frozen, deterministic)
+                    next_actions_il = self.il_actor._predict(
+                        next_obs, deterministic=True
+                    )
+
+                    _qc_target = _get_tqc_quantile_critics(self.critic_target)
+                    if _qc_target is not None:
+                        # TQC quantile path: compute features once, reuse
+                        feats = self.critic_target.features_extractor(next_obs)
+                        x_rl = torch.cat([feats, next_actions_rl], dim=-1)
+                        x_il = torch.cat([feats, next_actions_il], dim=-1)
+
+                        q_rl_all = torch.stack(
+                            [cn(x_rl) for cn in _qc_target], dim=1
+                        )  # (B, n_critics, n_q)
+                        q_il_all = torch.stack(
+                            [cn(x_il) for cn in _qc_target], dim=1
+                        )
+
+                        # Scalar comparison (mean over quantiles, min over critics)
+                        q_rl_scalar = q_rl_all.mean(dim=2).min(dim=1).values  # (B,)
+                        q_il_scalar = q_il_all.mean(dim=2).min(dim=1).values
+
+                        q_rl_adj_scalar = (
+                            q_rl_scalar - (ent_coef * next_log_prob_rl).squeeze(1)
+                        )
+                        use_il = q_il_scalar > q_rl_adj_scalar  # (B,) bool
+                        il_selection_rates.append(use_il.float().mean().item())
+
+                        # Per-sample selection over full quantile distributions
+                        q_rl_flat = q_rl_all.reshape(B, -1)   # (B, n_critics*n_q)
+                        q_il_flat = q_il_all.reshape(B, -1)
+                        # entropy adjustment broadcasts over quantile dim
+                        q_rl_adj_flat = q_rl_flat - ent_coef * next_log_prob_rl
+
+                        q_next_flat = torch.where(
+                            use_il.unsqueeze(1), q_il_flat, q_rl_adj_flat
+                        )
+
+                        # Sort + drop top quantiles (same as SafeTQC)
+                        sorted_q, _ = torch.sort(q_next_flat, dim=1)
+                        n_target = (
+                            sorted_q.shape[1]
+                            - self.top_quantiles_to_drop_per_net * len(_qc_target)
+                        )
+                        if n_target > 0:
+                            sorted_q = sorted_q[:, :n_target]
+                        next_q = sorted_q.mean(dim=1, keepdim=True)
+
+                    else:
+                        # SAC scalar path
+                        next_q_rl = self.critic_target(next_obs, next_actions_rl)
+                        next_q_il = self.critic_target(next_obs, next_actions_il)
+
+                        def _min_q(q_raw):
+                            if isinstance(q_raw, (list, tuple)):
+                                return torch.min(
+                                    torch.cat(q_raw, dim=1), dim=1, keepdim=True
+                                )[0]
+                            return q_raw
+
+                        q_rl_adj = _min_q(next_q_rl) - ent_coef * next_log_prob_rl
+                        q_il_v = _min_q(next_q_il)
+                        next_q = torch.max(q_rl_adj, q_il_v)
+
+                        use_il = (q_il_v > q_rl_adj).squeeze(1)
+                        il_selection_rates.append(use_il.float().mean().item())
+
+                    target_q = replay_data.rewards + (
+                        1 - replay_data.dones
+                    ) * self.gamma * next_q
+
+                # --- Current Q-values + critic loss ---
+                _qc = _get_tqc_quantile_critics(self.critic)
+                if _qc is not None:
+                    current_quantiles = []
+                    features = self.critic.features_extractor(
+                        replay_data.observations
+                    )
+                    x = torch.cat([features, replay_data.actions], dim=-1)
+                    for critic_net in _qc:
+                        current_quantiles.append(critic_net(x))
+                    critic_loss = 0.0
+                    n_quantiles = current_quantiles[0].shape[1]
+                    tau = (
+                        torch.arange(
+                            n_quantiles, device=self.device, dtype=torch.float32
+                        ) + 0.5
+                    ) / n_quantiles
+                    for current_q in current_quantiles:
+                        td_error = target_q.unsqueeze(1) - current_q.unsqueeze(2)
+                        huber = F.smooth_l1_loss(
+                            current_q.unsqueeze(2),
+                            target_q.unsqueeze(1).expand_as(current_q.unsqueeze(2)),
+                            reduction='none',
+                        )
+                        quantile_loss = (
+                            torch.abs(tau.view(1, -1, 1) - (td_error < 0).float())
+                            * huber
+                        )
+                        critic_loss = critic_loss + quantile_loss.sum(dim=1).mean()
+                else:
+                    current_q_raw = self.critic(
+                        replay_data.observations, replay_data.actions
+                    )
+                    if isinstance(current_q_raw, (list, tuple)):
+                        current_q_list = list(current_q_raw)
+                    elif current_q_raw.dim() == 3:
+                        current_q_list = [
+                            current_q_raw[:, i, :]
+                            for i in range(current_q_raw.shape[1])
+                        ]
+                    else:
+                        current_q_list = None
+
+                    if current_q_list is not None and current_q_list[0].shape[-1] > 1:
+                        critic_loss = 0.0
+                        n_quantiles = current_q_list[0].shape[-1]
+                        tau = (
+                            torch.arange(
+                                n_quantiles, device=self.device, dtype=torch.float32
+                            ) + 0.5
+                        ) / n_quantiles
+                        for current_q in current_q_list:
+                            td_error = target_q.unsqueeze(1) - current_q.unsqueeze(2)
+                            huber = F.smooth_l1_loss(
+                                current_q.unsqueeze(2),
+                                target_q.unsqueeze(1).expand_as(
+                                    current_q.unsqueeze(2)
+                                ),
+                                reduction='none',
+                            )
+                            quantile_loss = (
+                                torch.abs(
+                                    tau.view(1, -1, 1) - (td_error < 0).float()
+                                ) * huber
+                            )
+                            critic_loss = (
+                                critic_loss + quantile_loss.sum(dim=1).mean()
+                            )
+                    else:
+                        if current_q_list is not None:
+                            critic_loss = sum(
+                                F.mse_loss(q, target_q) for q in current_q_list
+                            )
+                        else:
+                            critic_loss = F.mse_loss(current_q_raw, target_q)
+
+                critic_losses.append(critic_loss.item())
+
+                self.critic.optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic.optimizer.step()
+
+                # --- Actor update ---
+                _qc_actor = _get_tqc_quantile_critics(self.critic)
+                if _qc_actor is not None:
+                    q_values = []
+                    features_pi = self.critic.features_extractor(
+                        replay_data.observations
+                    )
+                    x_pi = torch.cat([features_pi, actions_pi], dim=-1)
+                    for critic_net in _qc_actor:
+                        q_values.append(critic_net(x_pi).mean(dim=1, keepdim=True))
+                    qf_pi = torch.cat(q_values, dim=1).mean(dim=1, keepdim=True)
+                else:
+                    q_pi_raw = self.critic(replay_data.observations, actions_pi)
+                    if isinstance(q_pi_raw, (list, tuple)):
+                        qf_pi = torch.min(
+                            torch.cat(q_pi_raw, dim=1), dim=1, keepdim=True
+                        )[0]
+                    elif q_pi_raw.dim() == 3:
+                        qf_pi = q_pi_raw.mean(dim=2).mean(dim=1, keepdim=True)
+                    else:
+                        qf_pi = q_pi_raw
+
+                actor_loss = (ent_coef * log_prob - qf_pi).mean()
+                actor_losses.append(actor_loss.item())
+
+                self.actor.optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor.optimizer.step()
+
+                # --- Target network update ---
+                polyak_update(
+                    self.critic.parameters(),
+                    self.critic_target.parameters(),
+                    self.tau,
+                )
+
+            # Logging
+            self._n_updates += gradient_steps
+            self.logger.record("train/n_updates", self._n_updates)
+            self.logger.record("train/ent_coef", np.mean(ent_coefs))
+            self.logger.record("train/actor_loss", np.mean(actor_losses))
+            self.logger.record("train/critic_loss", np.mean(critic_losses))
+            if ent_coef_losses:
+                self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
+            if il_selection_rates:
+                self.logger.record(
+                    "train/ibrl_il_selection_rate", np.mean(il_selection_rates)
+                )
+
+        def _get_torch_save_params(self):
+            state_dicts, saved_vars = super()._get_torch_save_params()
+            if self.il_actor is not None:
+                state_dicts.append("il_actor.state_dict")
+            saved_vars += ["il_noise_std", "il_soft", "il_beta"]
+            return state_dicts, saved_vars
+
+    return DualPolicyTQC
+
+
 class SafeTrainingCallback:
     """Factory for creating the SafeTQC training callback.
 
@@ -1032,6 +1404,17 @@ Examples:
     safe_group.add_argument('--keep-proximity-reward', action='store_true',
                             help='Keep proximity penalty in reward even with --safe')
 
+    # Dual-policy (IBRL) arguments
+    dual_group = parser.add_argument_group('Dual-policy (IBRL)')
+    dual_group.add_argument('--dual-policy', action='store_true',
+                            help='Enable IBRL dual-policy (frozen IL anchor + RL actor)')
+    dual_group.add_argument('--dual-policy-noise', type=float, default=0.1,
+                            help='Gaussian noise std added to RL action proposals (default: 0.1)')
+    dual_group.add_argument('--dual-policy-soft', action='store_true',
+                            help='Boltzmann action selection instead of greedy argmax')
+    dual_group.add_argument('--dual-policy-beta', type=float, default=10.0,
+                            help='Boltzmann temperature for soft dual-policy (default: 10.0)')
+
     args = parser.parse_args()
 
     # Validate demo_ratio
@@ -1075,6 +1458,11 @@ Examples:
         print(f"    Cost critics: {args.cost_n_critics} ({args.cost_critic_type})")
         print(f"    Lagrange LR: {args.lagrange_lr}, init: {args.lagrange_init}")
         print(f"    Keep proximity reward: {args.keep_proximity_reward}")
+    if args.dual_policy:
+        print(f"  Dual-policy (IBRL): ENABLED")
+        print(f"    IL noise std: {args.dual_policy_noise}")
+        print(f"    Soft selection: {args.dual_policy_soft}")
+        print(f"    Boltzmann beta: {args.dual_policy_beta}")
     print("=" * 60 + "\n")
 
     # Validate demo data first (fail fast)
@@ -1100,11 +1488,21 @@ Examples:
         algo_name = "SAC"
         print("sb3-contrib not found, falling back to SAC")
 
+    # Mutual exclusion
+    if args.dual_policy and args.safe:
+        parser.error("--dual-policy and --safe are mutually exclusive")
+
     # Wrap with SafeTQC if --safe
     if args.safe:
         SafeTQC = _create_safe_tqc_class(algo_cls)
         algo_cls = SafeTQC
         algo_name = f"Safe{algo_name}"
+
+    # Wrap with DualPolicy if --dual-policy
+    if args.dual_policy:
+        DualPolicyClass = _create_dual_policy_class(algo_cls)
+        algo_cls = DualPolicyClass
+        algo_name = f"DualPolicy{algo_name}"
 
     print(f"Using algorithm: {algo_name}")
 
@@ -1293,12 +1691,32 @@ Examples:
             model.cost_critic_target.features_extractor.load_state_dict(fe_state)
             print("  Feature extractor weights copied to cost critic/cost_critic_target")
 
+    # Freeze IL actor for dual-policy (IBRL)
+    if args.dual_policy:
+        import copy as _copy
+        il_actor = _copy.deepcopy(model.policy.actor)
+        for p in il_actor.parameters():
+            p.requires_grad = False
+        il_actor.eval()
+        il_actor.to(device)
+        model.il_actor = il_actor
+        model.il_noise_std = args.dual_policy_noise
+        model.il_soft = args.dual_policy_soft
+        model.il_beta = args.dual_policy_beta
+        n_params = sum(p.numel() for p in il_actor.parameters())
+        if not args.resume:
+            print(f"  IL policy frozen from CVAE-pretrained actor ({n_params:,} params)")
+        else:
+            print(f"  IL policy frozen from resumed checkpoint ({n_params:,} params)")
+
     # Create callbacks
     checkpoint_dir = Path(args.output).parent / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     if "Safe" in algo_name:
         prefix = "safe_tqc_jetbot" if "TQC" in algo_name else "safe_sac_jetbot"
+    elif "DualPolicy" in algo_name:
+        prefix = "dual_tqc_jetbot" if "TQC" in algo_name else "dual_sac_jetbot"
     else:
         prefix = "tqc_jetbot" if algo_name == "TQC" else "sac_jetbot"
     checkpoint_callback = CheckpointCallback(
