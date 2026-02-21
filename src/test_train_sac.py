@@ -475,6 +475,35 @@ class TestInjectLayernorm:
             assert self._count_layernorms(net) == 2, f"qf{i}: expected 2 LayerNorm"
             assert self._count_ofn(net) == 1, f"qf{i}: expected 1 OFN"
 
+    def test_tqc_alt_attr_critics(self):
+        """Verify injection works when TQC uses 'critics' instead of 'quantile_critics'."""
+        import torch
+        import torch.nn as nn
+
+        class FakeTQCCriticAlt(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.critics = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Linear(36, 256), nn.ReLU(),
+                        nn.Linear(256, 256), nn.ReLU(),
+                        nn.Linear(256, 25),
+                    )
+                    for _ in range(2)
+                ])
+
+        model = Mock()
+        model.device = torch.device('cpu')
+        model.lr_schedule = Mock(return_value=3e-4)
+        model.critic = FakeTQCCriticAlt()
+        model.critic_target = FakeTQCCriticAlt()
+
+        inject_layernorm_into_critics(model)
+
+        for i, net in enumerate(model.critic.critics):
+            assert self._count_layernorms(net) == 2, f"Critic {i}: expected 2 LayerNorm"
+            assert self._count_ofn(net) == 1, f"Critic {i}: expected 1 OFN"
+
 
 # ============================================================================
 # TEST SUITE: Symlog
