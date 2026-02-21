@@ -34,7 +34,7 @@ env/
 *.swp
 *.swo
 *~
-
+*.hdf5
 # Jupyter
 .ipynb_checkpoints/
 
