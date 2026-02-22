@@ -378,6 +378,7 @@ CVAE pretraining (replaces BC warmstart):
 | `--chunk-size` | 10 | Action chunk size (k) |
 | `--n-frames` | 1 | Number of observations to stack (1 = no stacking) |
 | `--gru-hidden` | 128 | GRU hidden dimension (only used when n-frames > 1) |
+| `--gru-lr` | 1e-5 | GRU learning rate (only used when n-frames > 1) |
 | `--cvae-z-dim` | 8 | CVAE latent dimension |
 | `--cvae-epochs` | 100 | CVAE pretraining epochs |
 | `--cvae-beta` | 0.1 | CVAE KL weight |
