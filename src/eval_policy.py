@@ -72,6 +72,8 @@ Examples:
                         help='Path to VecNormalize stats .pkl file (auto-detected if not given)')
     parser.add_argument('--chunk-size', type=int, default=None,
                         help='Action chunk size (default: auto-detect from model)')
+    parser.add_argument('--n-frames', type=int, default=None,
+                        help='Number of stacked frames (default: auto-detect from model)')
     parser.add_argument('--inflation-radius', type=float, default=0.08,
                         help='Obstacle inflation radius for A* planner in meters (default: 0.08)')
     parser.add_argument('--safe', action='store_true',
@@ -107,7 +109,7 @@ Examples:
 
     # Import here to allow --help without Isaac Sim
     import train_sac  # noqa: F401 — registers ChunkCVAEFeatureExtractor for model deserialization
-    from jetbot_rl_env import JetbotNavigationEnv, ChunkedEnvWrapper
+    from jetbot_rl_env import JetbotNavigationEnv, ChunkedEnvWrapper, FrameStackWrapper
     from stable_baselines3 import PPO, SAC
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -174,17 +176,32 @@ Examples:
         chunk_size = model_action_dim // 2
         print(f"  Auto-detected chunk_size={chunk_size} from model action_dim={model_action_dim}")
 
+    # Auto-detect n_frames from model observation space
+    model_obs_dim = model.observation_space.shape[0]
+    n_frames = args.n_frames
+    if n_frames is None and model_obs_dim > 34:
+        n_frames = model_obs_dim // 34
+        print(f"  Auto-detected n_frames={n_frames} from model obs_dim={model_obs_dim}")
+
+    # Wrap env with FrameStackWrapper if frame-stacked model
+    if n_frames is not None and n_frames > 1:
+        raw_env = FrameStackWrapper(raw_env, n_frames=n_frames)
+        print(f"  Wrapped env with FrameStackWrapper(n_frames={n_frames})")
+
     # Wrap env with ChunkedEnvWrapper if chunked model
     if chunk_size is not None and chunk_size > 1:
         raw_env = ChunkedEnvWrapper(raw_env, chunk_size=chunk_size, gamma=0.99)
+        print(f"  Wrapped env with ChunkedEnvWrapper(k={chunk_size})")
+        print(f"  Action space (chunked): {raw_env.action_space.shape}")
+
+    # Recreate vec_env if any wrappers were applied
+    if (n_frames is not None and n_frames > 1) or (chunk_size is not None and chunk_size > 1):
         # Recreate vec_env with the wrapped env
         vec_env = DummyVecEnv([lambda: raw_env])
         if vecnorm_path and vecnorm_path.exists():
             vec_env = VecNormalize.load(str(vecnorm_path), vec_env)
             vec_env.training = False
             vec_env.norm_reward = False
-        print(f"  Wrapped env with ChunkedEnvWrapper(k={chunk_size})")
-        print(f"  Action space (chunked): {raw_env.action_space.shape}")
 
     # Re-load model with the (possibly wrapped) env
     model.set_env(vec_env)

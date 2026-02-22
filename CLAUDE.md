@@ -52,7 +52,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 
 6. **Shared Modules**
    - `jetbot_config.py` - Single source of truth for robot physical constants (`WHEEL_RADIUS`, `WHEEL_BASE`, velocity limits, start pose, workspace bounds) and `quaternion_to_yaw()` utility
-   - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, `extract_action_chunks()`, `make_chunk_transitions()`, and `VerboseEpisodeCallback`
+   - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, `extract_action_chunks()`, `make_chunk_transitions()`, `build_frame_stacks()`, and `VerboseEpisodeCallback`
    - `demo_io.py` - Unified demo I/O adapter: `open_demo()` dispatches `.npz`/`.hdf5`, `HDF5DemoWriter` for O(delta) incremental recording, `convert_npz_to_hdf5()` migration utility
 
 ### Key Classes
@@ -70,8 +70,10 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **LidarSensor**: Analytical 2D raycasting for obstacle detection (no physics dependency)
 - **OccupancyGrid**: 2D boolean grid from obstacle geometry, inflated by robot radius for C-space planning
 - **AutoPilot**: A*-based expert controller with privileged scene access for collision-free demo collection
+- **FrameStackWrapper**: Gymnasium wrapper stacking last n_frames observations into a single flattened vector; oldest first for natural GRU input order (`src/jetbot_rl_env.py`)
 - **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking (`src/jetbot_rl_env.py`)
 - **ChunkCVAEFeatureExtractor**: SB3 feature extractor splitting obs into state MLP (10→32D) + LiDAR MLP (24→64D) + z-pad (8D) = 104D
+- **TemporalCVAEFeatureExtractor**: GRU-based SB3 feature extractor for frame-stacked obs; per-frame state/lidar MLPs → GRU → hidden state + z-pad (`src/train_sac.py`)
 - **pretrain_chunk_cvae()**: CVAE pretraining — encoder maps (obs, action_chunk) → z, decoder (= actor's latent_pi + mu) maps (obs_features || z) → action_chunk; encoder discarded after pretraining
 - **SafeTQC**: TQC subclass with dual cost critic + Lagrange multiplier for constrained RL (`src/train_sac.py`)
 - **CostReplayBuffer**: Parallel ring buffer storing per-transition costs alongside the main replay buffer (`src/train_sac.py`)
@@ -183,6 +185,9 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 # Custom CVAE hyperparameters
 ./run.sh train_sac.py --demos demos/recording.npz --headless \
   --cvae-epochs 200 --cvae-beta 0.05 --cvae-z-dim 16
+
+# SAC/TQC with GRU recurrent policy via frame stacking
+./run.sh train_sac.py --demos demos/recording.npz --headless --n-frames 4 --gru-hidden 128
 
 # Resume SAC/TQC training from checkpoint
 ./run.sh train_sac.py --demos demos/recording.npz --headless --resume models/checkpoints/tqc_jetbot_50000_steps.zip --timesteps 500000
@@ -327,6 +332,15 @@ ChunkCVAEFeatureExtractor:
                      [lidar 10:34] → symlog → MLP(24→128→64)  →  64D ├→ concat → 96D + z_pad(8D) = 104D
                                                                       └→ z_pad = zeros(z_dim)
 
+TemporalCVAEFeatureExtractor (when --n-frames > 1):
+  Wrapping order: ChunkedEnvWrapper( FrameStackWrapper( JetbotNavigationEnv ) )
+  Input: (batch, n_frames * 34) flattened
+  Reshape → (batch, n_frames, 34)
+  Per-frame:  state_mlp(obs[:10]) → 32D  }
+              lidar_mlp(obs[10:34]) → 64D } → 96D per frame
+  GRU: (batch, n_frames, 96) → last hidden → (batch, gru_hidden_dim)
+  Z-pad: concat(gru_output, zeros(z_dim)) → (gru_hidden_dim + z_dim)D
+
 CVAE pretraining (replaces BC warmstart):
   Encoder (train-only): (obs_features, action_chunk) → z
   Decoder (= actor's latent_pi + mu): (obs_features, z) → action_chunk
@@ -346,19 +360,24 @@ CVAE pretraining (replaces BC warmstart):
 ### Key Functions & Classes (`src/train_sac.py`)
 - **symlog()**: DreamerV3 symmetric log compression
 - **ChunkCVAEFeatureExtractor.get_class()**: Returns SB3 BaseFeaturesExtractor with split state/lidar MLPs + z-pad
+- **TemporalCVAEFeatureExtractor.get_class()**: Returns GRU-based SB3 feature extractor for frame-stacked observations
 - **pretrain_chunk_cvae()**: CVAE pretraining on demo action chunks; trains feature extractor + actor layers
 
 ### Key Functions (`src/demo_utils.py`)
 - **extract_action_chunks()**: Sliding-window action chunks within episode boundaries
 - **make_chunk_transitions()**: Chunk-level (obs, action, R_chunk, next_obs, done) transitions
+- **build_frame_stacks()**: Converts step-level obs (N, 34) → (N, n_frames * 34), respecting episode boundaries
 
 ### Key Classes (`src/jetbot_rl_env.py`)
+- **FrameStackWrapper**: Gymnasium wrapper stacking last n_frames observations into (n_frames * obs_dim,), oldest first
 - **ChunkedEnvWrapper**: Gymnasium wrapper expanding action space to (k*2,), executing k sub-steps
 
 ### CLI Flags
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--chunk-size` | 10 | Action chunk size (k) |
+| `--n-frames` | 1 | Number of observations to stack (1 = no stacking) |
+| `--gru-hidden` | 128 | GRU hidden dimension (only used when n-frames > 1) |
 | `--cvae-z-dim` | 8 | CVAE latent dimension |
 | `--cvae-epochs` | 100 | CVAE pretraining epochs |
 | `--cvae-beta` | 0.1 | CVAE KL weight |

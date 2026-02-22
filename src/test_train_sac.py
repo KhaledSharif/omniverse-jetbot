@@ -56,14 +56,15 @@ from train_sac import (
     inject_layernorm_into_critics,
     symlog,
     ChunkCVAEFeatureExtractor,
+    TemporalCVAEFeatureExtractor,
     pretrain_chunk_cvae,
     CostReplayBuffer,
     MeanCostCritic,
     _create_safe_tqc_class,
     _create_dual_policy_class,
 )
-from demo_utils import extract_action_chunks, make_chunk_transitions
-from jetbot_rl_env import ChunkedEnvWrapper
+from demo_utils import extract_action_chunks, make_chunk_transitions, build_frame_stacks
+from jetbot_rl_env import ChunkedEnvWrapper, FrameStackWrapper
 from jetbot_keyboard_control import RewardComputer
 
 
@@ -1373,3 +1374,290 @@ class TestDualPolicyTQC:
 
         # With beta=1000 and Q_IL >> Q_RL, IL should win nearly every time
         assert wins_il >= 18, f"Expected IL to win >= 18/20 runs, got {wins_il}/20"
+
+
+# ============================================================================
+# TEST SUITE: FrameStackWrapper
+# ============================================================================
+
+class TestFrameStackWrapper:
+    def _make_mock_env(self, obs_dim=34, act_dim=2):
+        """Create a minimal gymnasium.Env subclass for testing."""
+        import gymnasium as gym
+
+        class _MinimalEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32)
+                self._step_count = 0
+
+            def reset(self, **kwargs):
+                self._step_count = 0
+                return np.ones(obs_dim, dtype=np.float32) * 0.5, {}
+
+            def step(self, action):
+                self._step_count += 1
+                obs = np.ones(obs_dim, dtype=np.float32) * self._step_count
+                return obs, 1.0, False, False, {}
+
+        return _MinimalEnv()
+
+    def test_obs_space_shape(self):
+        """Observation space is (n_frames * obs_dim,)."""
+        inner = self._make_mock_env()
+        wrapper = FrameStackWrapper(inner, n_frames=4)
+        assert wrapper.observation_space.shape == (4 * 34,)
+
+    def test_action_space_unchanged(self):
+        """Action space is unchanged by wrapper."""
+        inner = self._make_mock_env()
+        wrapper = FrameStackWrapper(inner, n_frames=4)
+        assert wrapper.action_space.shape == (2,)
+
+    def test_reset_fills_all_frames(self):
+        """After reset(), all frames contain the initial observation."""
+        inner = self._make_mock_env()
+        wrapper = FrameStackWrapper(inner, n_frames=3)
+        obs, _ = wrapper.reset()
+
+        assert obs.shape == (3 * 34,)
+        # All three frames should be identical (the reset obs = 0.5 everywhere)
+        frame0 = obs[:34]
+        frame1 = obs[34:68]
+        frame2 = obs[68:102]
+        np.testing.assert_array_equal(frame0, frame1)
+        np.testing.assert_array_equal(frame1, frame2)
+        assert frame0[0] == 0.5
+
+    def test_step_shifts_frames(self):
+        """After step(), newest obs is in the last frame slot."""
+        inner = self._make_mock_env()
+        wrapper = FrameStackWrapper(inner, n_frames=3)
+        obs, _ = wrapper.reset()
+
+        # Step 1: inner returns obs filled with 1.0
+        obs1, _, _, _, _ = wrapper.step(np.zeros(2))
+        # Frames should be: [0.5, 0.5, 1.0]
+        assert obs1[2 * 34] == 1.0  # Last frame, first element
+        assert obs1[0] == 0.5       # First frame, first element
+
+        # Step 2: inner returns obs filled with 2.0
+        obs2, _, _, _, _ = wrapper.step(np.zeros(2))
+        # Frames should be: [0.5, 1.0, 2.0]
+        assert obs2[0] == 0.5       # Oldest frame
+        assert obs2[34] == 1.0      # Middle frame
+        assert obs2[2 * 34] == 2.0  # Newest frame
+
+    def test_episode_boundary_no_leakage(self):
+        """After reset(), previous episode's frames are cleared."""
+        inner = self._make_mock_env()
+        wrapper = FrameStackWrapper(inner, n_frames=3)
+        wrapper.reset()
+
+        # Take a few steps
+        wrapper.step(np.zeros(2))
+        wrapper.step(np.zeros(2))
+
+        # Reset - all frames should be the new initial obs, not old steps
+        obs, _ = wrapper.reset()
+        frame0 = obs[:34]
+        frame1 = obs[34:68]
+        frame2 = obs[68:102]
+        np.testing.assert_array_equal(frame0, frame1)
+        np.testing.assert_array_equal(frame1, frame2)
+
+
+# ============================================================================
+# TEST SUITE: TemporalCVAEFeatureExtractor
+# ============================================================================
+
+class TestTemporalCVAEFeatureExtractor:
+    def _make_extractor(self, n_frames=4, gru_hidden=128, z_dim=8):
+        import torch
+        import gymnasium as gym
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+        obs_dim = n_frames * 34
+        obs_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        cls = TemporalCVAEFeatureExtractor.create(
+            BaseFeaturesExtractor, n_frames=n_frames,
+            gru_hidden_dim=gru_hidden, z_dim=z_dim)
+        features_dim = gru_hidden + z_dim
+        return cls(obs_space, features_dim=features_dim)
+
+    def test_output_shape(self):
+        """Feature extractor produces (batch, gru_hidden + z_dim)."""
+        import torch
+        ext = self._make_extractor(n_frames=4, gru_hidden=128, z_dim=8)
+        obs = torch.randn(8, 4 * 34)
+        out = ext(obs)
+        assert out.shape == (8, 136)
+
+    def test_z_slot_is_zero(self):
+        """Last z_dim entries are zeros during forward()."""
+        import torch
+        z_dim = 8
+        ext = self._make_extractor(n_frames=4, gru_hidden=128, z_dim=z_dim)
+        obs = torch.randn(4, 4 * 34)
+        out = ext(obs)
+        z_slot = out[:, -z_dim:]
+        torch.testing.assert_close(z_slot, torch.zeros(4, z_dim))
+
+    def test_encode_obs_shape(self):
+        """encode_obs returns (batch, gru_hidden_dim)."""
+        import torch
+        ext = self._make_extractor(n_frames=4, gru_hidden=128, z_dim=8)
+        obs = torch.randn(4, 4 * 34)
+        obs_features = ext.encode_obs(obs)
+        assert obs_features.shape == (4, 128)
+
+    def test_obs_feature_dim_attribute(self):
+        """_obs_feature_dim matches gru_hidden_dim."""
+        ext = self._make_extractor(n_frames=4, gru_hidden=64, z_dim=8)
+        assert ext._obs_feature_dim == 64
+
+    def test_gradient_flow_through_gru(self):
+        """Gradients flow through state_mlp, lidar_mlp, and GRU."""
+        import torch
+        ext = self._make_extractor(n_frames=4, gru_hidden=128, z_dim=8)
+        ext.train()
+        obs = torch.randn(4, 4 * 34)
+        out = ext(obs)
+        loss = out.sum()
+        loss.backward()
+        # Check state MLP gradients
+        assert ext.state_mlp[0].weight.grad is not None
+        # Check lidar MLP gradients
+        assert ext.lidar_mlp[0].weight.grad is not None
+        # Check GRU gradients
+        assert ext.gru.weight_ih_l0.grad is not None
+
+    def test_temporal_sensitivity(self):
+        """Changing one frame changes the output (GRU is not ignoring input)."""
+        import torch
+        ext = self._make_extractor(n_frames=4, gru_hidden=128, z_dim=8)
+        ext.eval()
+        obs1 = torch.randn(1, 4 * 34)
+        obs2 = obs1.clone()
+        # Change only the last frame
+        obs2[0, 3 * 34:] = torch.randn(34)
+        with torch.no_grad():
+            out1 = ext(obs1)
+            out2 = ext(obs2)
+        # Outputs should differ
+        assert not torch.allclose(out1, out2, atol=1e-6)
+
+
+# ============================================================================
+# TEST SUITE: build_frame_stacks
+# ============================================================================
+
+class TestBuildFrameStacks:
+    def test_output_shape(self):
+        """Output shape is (N, n_frames * obs_dim)."""
+        total = 20
+        obs = np.random.randn(total, 34).astype(np.float32)
+        ep_lengths = np.array([10, 10])
+        result = build_frame_stacks(obs, ep_lengths, n_frames=4)
+        assert result.shape == (20, 4 * 34)
+
+    def test_first_step_repeats(self):
+        """First step of each episode repeats the initial obs for all frames."""
+        total = 10
+        obs = np.arange(total * 34, dtype=np.float32).reshape(total, 34)
+        ep_lengths = np.array([5, 5])
+        result = build_frame_stacks(obs, ep_lengths, n_frames=3)
+
+        # First step of ep1 (index 0): all 3 frames should be obs[0]
+        for f in range(3):
+            np.testing.assert_array_equal(result[0, f * 34:(f + 1) * 34], obs[0])
+
+        # First step of ep2 (index 5): all 3 frames should be obs[5]
+        for f in range(3):
+            np.testing.assert_array_equal(result[5, f * 34:(f + 1) * 34], obs[5])
+
+    def test_later_step_correct_history(self):
+        """Step t=3 with n_frames=3 should have frames [obs[1], obs[2], obs[3]]."""
+        total = 10
+        obs = np.arange(total * 34, dtype=np.float32).reshape(total, 34)
+        ep_lengths = np.array([10])
+        result = build_frame_stacks(obs, ep_lengths, n_frames=3)
+
+        # Step t=3: frames should be obs[1], obs[2], obs[3]
+        np.testing.assert_array_equal(result[3, :34], obs[1])
+        np.testing.assert_array_equal(result[3, 34:68], obs[2])
+        np.testing.assert_array_equal(result[3, 68:102], obs[3])
+
+    def test_episode_boundary_no_cross(self):
+        """Frame stacking does not cross episode boundaries."""
+        total = 10
+        obs = np.arange(total * 34, dtype=np.float32).reshape(total, 34)
+        ep_lengths = np.array([5, 5])
+        result = build_frame_stacks(obs, ep_lengths, n_frames=3)
+
+        # Step t=1 of ep2 (index 6): n_frames=3 means we need t-2, t-1, t
+        # t-2 = -1 < 0, so repeat obs[5]; t-1 = 0 → obs[5]; t = 1 → obs[6]
+        np.testing.assert_array_equal(result[6, :34], obs[5])
+        np.testing.assert_array_equal(result[6, 34:68], obs[5])
+        np.testing.assert_array_equal(result[6, 68:102], obs[6])
+
+    def test_n_frames_1_identity(self):
+        """n_frames=1 returns the original observations unchanged."""
+        total = 10
+        obs = np.random.randn(total, 34).astype(np.float32)
+        ep_lengths = np.array([5, 5])
+        result = build_frame_stacks(obs, ep_lengths, n_frames=1)
+        np.testing.assert_array_equal(result, obs)
+
+
+# ============================================================================
+# TEST SUITE: FrameStackWrapper + ChunkedEnvWrapper integration
+# ============================================================================
+
+class TestFrameStackChunkedIntegration:
+    def _make_mock_env(self, obs_dim=34, act_dim=2):
+        import gymnasium as gym
+
+        class _MinimalEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32)
+
+            def reset(self, **kwargs):
+                return np.zeros(obs_dim, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.ones(obs_dim, dtype=np.float32), 1.0, False, False, {}
+
+        return _MinimalEnv()
+
+    def test_combined_spaces(self):
+        """FrameStack(n=4) + Chunked(k=5) → obs=(136,), action=(10,)."""
+        inner = self._make_mock_env()
+        stacked = FrameStackWrapper(inner, n_frames=4)
+        chunked = ChunkedEnvWrapper(stacked, chunk_size=5, gamma=0.99)
+
+        assert chunked.observation_space.shape == (4 * 34,)
+        assert chunked.action_space.shape == (5 * 2,)
+
+    def test_combined_step(self):
+        """Combined wrapper executes correctly."""
+        inner = self._make_mock_env()
+        stacked = FrameStackWrapper(inner, n_frames=2)
+        chunked = ChunkedEnvWrapper(stacked, chunk_size=3, gamma=0.99)
+
+        obs, _ = chunked.reset()
+        assert obs.shape == (2 * 34,)
+
+        action = np.zeros(3 * 2, dtype=np.float32)
+        obs, reward, terminated, truncated, info = chunked.step(action)
+        assert obs.shape == (2 * 34,)
+        # Reward should be accumulated over 3 sub-steps
+        expected_reward = 1.0 + 0.99 * 1.0 + 0.99**2 * 1.0
+        assert abs(reward - expected_reward) < 1e-6

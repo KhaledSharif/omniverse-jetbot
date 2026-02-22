@@ -104,6 +104,101 @@ class ChunkCVAEFeatureExtractor:
         return cls._cls
 
 
+class TemporalCVAEFeatureExtractor:
+    """SB3 feature extractor with GRU over stacked observation frames.
+
+    Input: (batch, n_frames * 34) flattened frame-stacked observations.
+    Reshapes to (batch, n_frames, 34), applies per-frame state/lidar MLPs
+    to get 96D per frame, feeds through a single-layer GRU, takes the last
+    hidden state, and concatenates a zero-padded z-slot.
+
+    Output: concat(gru_hidden, z_pad) = gru_hidden_dim + z_dim
+    """
+
+    _cls = None
+
+    @staticmethod
+    def create(base_extractor_cls, n_frames, gru_hidden_dim=128, z_dim=8):
+        import torch
+        import torch.nn as nn
+
+        class _TemporalCVAEFeatureExtractor(base_extractor_cls):
+            def __init__(self, observation_space, features_dim=None):
+                if features_dim is None:
+                    features_dim = gru_hidden_dim + z_dim
+                super().__init__(observation_space, features_dim=features_dim)
+                self._z_dim = z_dim
+                self._obs_feature_dim = gru_hidden_dim
+                self._n_frames = n_frames
+                self._per_frame_dim = 34
+
+                self.state_mlp = nn.Sequential(
+                    nn.Linear(10, 64),
+                    nn.SiLU(),
+                    nn.Linear(64, 32),
+                    nn.SiLU(),
+                )
+
+                self.lidar_mlp = nn.Sequential(
+                    nn.Linear(24, 128),
+                    nn.SiLU(),
+                    nn.Linear(128, 64),
+                    nn.SiLU(),
+                )
+
+                self.gru = nn.GRU(
+                    input_size=96,
+                    hidden_size=gru_hidden_dim,
+                    num_layers=1,
+                    batch_first=True,
+                )
+
+            def encode_obs(self, observations):
+                """Encode frame-stacked observations into obs_features via GRU.
+
+                Args:
+                    observations: (batch, n_frames * 34) tensor
+
+                Returns:
+                    obs_features tensor of shape (batch, gru_hidden_dim)
+                """
+                batch = observations.shape[0]
+                # Reshape to (batch, n_frames, 34)
+                x = observations.view(batch, self._n_frames, self._per_frame_dim)
+
+                # Per-frame MLP: process all frames at once
+                # Flatten to (batch * n_frames, 34) for MLP
+                x_flat = x.reshape(batch * self._n_frames, self._per_frame_dim)
+                state = symlog(x_flat[:, :10])
+                lidar = symlog(x_flat[:, 10:34])
+                state_features = self.state_mlp(state)   # (B*T, 32)
+                lidar_features = self.lidar_mlp(lidar)    # (B*T, 64)
+                frame_features = torch.cat([state_features, lidar_features], dim=-1)  # (B*T, 96)
+
+                # Reshape back to sequence: (batch, n_frames, 96)
+                frame_features = frame_features.view(batch, self._n_frames, 96)
+
+                # GRU: take last hidden state
+                _, h_n = self.gru(frame_features)  # h_n: (1, batch, gru_hidden_dim)
+                return h_n.squeeze(0)  # (batch, gru_hidden_dim)
+
+            def forward(self, observations):
+                obs_features = self.encode_obs(observations)
+                z_pad = torch.zeros(
+                    obs_features.shape[0], self._z_dim,
+                    device=obs_features.device, dtype=obs_features.dtype,
+                )
+                return torch.cat([obs_features, z_pad], dim=-1)
+
+        return _TemporalCVAEFeatureExtractor
+
+    @classmethod
+    def get_class(cls, base_extractor_cls, n_frames, gru_hidden_dim=128, z_dim=8):
+        cls._cls = cls.create(base_extractor_cls, n_frames,
+                              gru_hidden_dim=gru_hidden_dim, z_dim=z_dim)
+        return cls._cls
+
+
 def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
                         chunk_size, z_dim=8, epochs=100, batch_size=256,
                         lr=1e-3, beta=0.1, gamma=0.99):
@@ -1348,6 +1443,10 @@ Examples:
                         help='CVAE KL weight (default: 0.1)')
     parser.add_argument('--cvae-lr', type=float, default=1e-3,
                         help='CVAE pretraining learning rate (default: 1e-3)')
+    parser.add_argument('--n-frames', type=int, default=1,
+                        help='Number of observations to stack (1 = no stacking, default: 1)')
+    parser.add_argument('--gru-hidden', type=int, default=128,
+                        help='GRU hidden dimension (only used when --n-frames > 1, default: 128)')
 
     # Environment arguments
     parser.add_argument('--reward-mode', choices=['dense', 'sparse'], default='dense',
@@ -1443,6 +1542,8 @@ Examples:
     print(f"  Learning starts: {args.learning_starts}")
     print(f"  CVAE: z_dim={args.cvae_z_dim}, epochs={args.cvae_epochs}, "
           f"beta={args.cvae_beta}, lr={args.cvae_lr}")
+    if args.n_frames > 1:
+        print(f"  Frame stacking: n_frames={args.n_frames}, gru_hidden={args.gru_hidden}")
     print(f"  Reward mode: {args.reward_mode}")
     print(f"  Headless: {args.headless}")
     print(f"  Seed: {args.seed}")
@@ -1470,7 +1571,7 @@ Examples:
 
     # Import here to allow --help without Isaac Sim
     import torch
-    from jetbot_rl_env import JetbotNavigationEnv, ChunkedEnvWrapper
+    from jetbot_rl_env import JetbotNavigationEnv, ChunkedEnvWrapper, FrameStackWrapper
     from stable_baselines3.common.vec_env import DummyVecEnv
     from stable_baselines3.common.buffers import ReplayBuffer
     from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback, BaseCallback
@@ -1524,6 +1625,9 @@ Examples:
         cost_type=getattr(args, 'cost_type', 'proximity'),
         safe_mode=safe_mode,
     )
+    if args.n_frames > 1:
+        raw_env = FrameStackWrapper(raw_env, n_frames=args.n_frames)
+        print(f"  FrameStackWrapper: n_frames={args.n_frames}, obs {34} → {raw_env.observation_space.shape[0]}")
     raw_env = ChunkedEnvWrapper(raw_env, chunk_size=args.chunk_size, gamma=args.gamma)
     print(f"  Environment created in {_time.time() - _t0:.1f}s")
     print(f"  Observation space: {raw_env.observation_space.shape}")
@@ -1545,6 +1649,14 @@ Examples:
     from demo_io import open_demo
     demo_data = open_demo(args.demos)
     episode_lengths = demo_data['episode_lengths']
+
+    # Frame-stack demo observations if using temporal processing
+    if args.n_frames > 1:
+        from demo_utils import build_frame_stacks
+        print(f"Frame-stacking demo observations: {demo_obs_step.shape[1]}D → "
+              f"{args.n_frames * demo_obs_step.shape[1]}D")
+        demo_obs_step = build_frame_stacks(demo_obs_step, episode_lengths, args.n_frames)
+        print(f"  Stacked obs shape: {demo_obs_step.shape}")
 
     # Build chunk-level transitions (for replay buffer)
     print("Building chunk-level transitions...")
@@ -1596,7 +1708,10 @@ Examples:
     effective_gamma = args.gamma ** args.chunk_size
 
     # Feature extractor dimensions
-    obs_feature_dim = 96
+    if args.n_frames > 1:
+        obs_feature_dim = args.gru_hidden
+    else:
+        obs_feature_dim = 96
     features_dim = obs_feature_dim + args.cvae_z_dim
 
     # Create or resume model
@@ -1614,6 +1729,12 @@ Examples:
         if loaded_chunk != args.chunk_size:
             print(f"  Warning: loaded model chunk_size={loaded_chunk} != --chunk-size={args.chunk_size}")
             print(f"  Using loaded chunk_size={loaded_chunk}")
+        # Auto-detect n_frames from loaded model obs space
+        loaded_obs_dim = model.observation_space.shape[0]
+        if loaded_obs_dim > 34 and args.n_frames == 1:
+            detected_n_frames = loaded_obs_dim // 34
+            print(f"  Auto-detected n_frames={detected_n_frames} from model obs_dim={loaded_obs_dim}")
+            args.n_frames = detected_n_frames
         # Override mutable hyperparams the user may have changed
         model.learning_rate = args.lr
         model.batch_size = args.batch_size
@@ -1627,8 +1748,13 @@ Examples:
         print(f"  Model resumed in {_time.time() - _t0:.1f}s")
     else:
         print(f"Creating {algo_name} model...")
-        fe_cls = ChunkCVAEFeatureExtractor.get_class(
-            BaseFeaturesExtractor, z_dim=args.cvae_z_dim)
+        if args.n_frames > 1:
+            fe_cls = TemporalCVAEFeatureExtractor.get_class(
+                BaseFeaturesExtractor, n_frames=args.n_frames,
+                gru_hidden_dim=args.gru_hidden, z_dim=args.cvae_z_dim)
+        else:
+            fe_cls = ChunkCVAEFeatureExtractor.get_class(
+                BaseFeaturesExtractor, z_dim=args.cvae_z_dim)
         policy_kwargs = dict(
             net_arch=dict(pi=[256, 256], qf=[256, 256]),
             activation_fn=torch.nn.ReLU,

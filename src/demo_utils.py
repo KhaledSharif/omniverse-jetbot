@@ -295,6 +295,44 @@ def make_chunk_transitions(demo_obs, demo_actions, demo_rewards, demo_dones,
     return result
 
 
+def build_frame_stacks(demo_obs, episode_lengths, n_frames):
+    """Convert step-level demo observations to frame-stacked observations.
+
+    For each step t in each episode, stacks the last n_frames observations.
+    Early steps repeat the episode's first observation for missing slots,
+    matching FrameStackWrapper.reset() behavior.
+
+    Args:
+        demo_obs: numpy array of observations (N, obs_dim)
+        episode_lengths: numpy array of per-episode step counts
+        n_frames: number of frames to stack
+
+    Returns:
+        numpy array of shape (N, n_frames * obs_dim)
+    """
+    obs_dim = demo_obs.shape[1]
+    total = len(demo_obs)
+    stacked = np.zeros((total, n_frames * obs_dim), dtype=np.float32)
+
+    offset = 0
+    for length in episode_lengths:
+        length = int(length)
+        for t in range(length):
+            abs_t = offset + t
+            frames = []
+            for f in range(n_frames):
+                # Index into the past: t - (n_frames - 1 - f)
+                src_t = t - (n_frames - 1 - f)
+                if src_t < 0:
+                    frames.append(demo_obs[offset])  # Repeat first obs
+                else:
+                    frames.append(demo_obs[offset + src_t])
+            stacked[abs_t] = np.concatenate(frames)
+        offset += length
+
+    return stacked
+
+
 class VerboseEpisodeCallback:
     """Prints episode stats and periodic step-rate info during training.
 

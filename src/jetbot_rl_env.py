@@ -514,6 +514,45 @@ class JetbotNavigationEnv(gymnasium.Env):
             self.simulation_app.close()
 
 
+class FrameStackWrapper(gymnasium.Wrapper):
+    """Wrapper that stacks the last n_frames observations into a single vector.
+
+    Maintains a ring buffer of recent observations. On reset(), all slots are
+    filled with the initial observation. On step(), the newest observation
+    replaces the oldest. Output is flattened: (n_frames * obs_dim,).
+
+    Frame order: oldest first (index 0), newest last — natural for GRU input.
+    """
+
+    def __init__(self, env, n_frames):
+        super().__init__(env)
+        self.n_frames = n_frames
+        self._obs_dim = env.observation_space.shape[0]
+
+        # Tile observation space bounds
+        low = np.tile(env.observation_space.low, n_frames)
+        high = np.tile(env.observation_space.high, n_frames)
+        self.observation_space = spaces.Box(
+            low=low, high=high, dtype=env.observation_space.dtype
+        )
+
+        # Ring buffer
+        self._frames = np.zeros((n_frames, self._obs_dim), dtype=np.float32)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        for i in range(self.n_frames):
+            self._frames[i] = obs
+        return self._frames.flatten().copy(), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        # Shift left and append new obs
+        self._frames[:-1] = self._frames[1:]
+        self._frames[-1] = obs
+        return self._frames.flatten().copy(), reward, terminated, truncated, info
+
+
 class ChunkedEnvWrapper(gymnasium.Wrapper):
     """Wrapper that converts single-step actions to k-step action chunks.
 
