@@ -201,7 +201,7 @@ class TemporalCVAEFeatureExtractor:
 
 def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
                         chunk_size, z_dim=8, epochs=100, batch_size=256,
-                        lr=1e-3, beta=0.1, gamma=0.99):
+                        lr=1e-3, beta=0.1, gamma=0.99, gru_lr=None):
     """Pretrain actor via Chunk CVAE: encoder maps (obs, action_chunk) → z,
     decoder (= actor's latent_pi + mu) maps (obs_features || z) → action_chunk.
 
@@ -219,6 +219,7 @@ def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
         lr: learning rate
         beta: KL weight
         gamma: discount factor (unused here, kept for API consistency)
+        gru_lr: separate learning rate for GRU parameters (None = use lr for all)
     """
     import torch
     import torch.nn as nn
@@ -258,15 +259,38 @@ def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
     cvae_logvar = nn.Linear(64, z_dim).to(device)
 
     # Parameters to optimize: feature_extractor + latent_pi + mu + cvae_encoder
-    params = (
-        list(model.actor.features_extractor.parameters())
-        + list(model.actor.latent_pi.parameters())
-        + list(model.actor.mu.parameters())
-        + list(cvae_encoder.parameters())
-        + list(cvae_mu.parameters())
-        + list(cvae_logvar.parameters())
-    )
-    optimizer = torch.optim.Adam(params, lr=lr)
+    if gru_lr is not None and hasattr(model.actor.features_extractor, 'gru'):
+        # Split into GRU params (low LR) and everything else (CVAE LR)
+        gru_params, other_fe_params = [], []
+        for name, param in model.actor.features_extractor.named_parameters():
+            if 'gru.' in name:
+                gru_params.append(param)
+            else:
+                other_fe_params.append(param)
+        other_params = (
+            other_fe_params
+            + list(model.actor.latent_pi.parameters())
+            + list(model.actor.mu.parameters())
+            + list(cvae_encoder.parameters())
+            + list(cvae_mu.parameters())
+            + list(cvae_logvar.parameters())
+        )
+        param_groups = [
+            {'params': other_params, 'lr': lr},
+            {'params': gru_params, 'lr': gru_lr},
+        ]
+        optimizer = torch.optim.Adam(param_groups)
+        print(f"  CVAE optimizer: base_lr={lr}, gru_lr={gru_lr}")
+    else:
+        params = (
+            list(model.actor.features_extractor.parameters())
+            + list(model.actor.latent_pi.parameters())
+            + list(model.actor.mu.parameters())
+            + list(cvae_encoder.parameters())
+            + list(cvae_mu.parameters())
+            + list(cvae_logvar.parameters())
+        )
+        optimizer = torch.optim.Adam(params, lr=lr)
 
     print(f"  Training CVAE for {epochs} epochs...")
 
@@ -283,7 +307,9 @@ def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
             obs_features = model.actor.features_extractor.encode_obs(obs_batch)
 
             # CVAE encoder: (obs_features, action_chunk) → z
-            enc_input = torch.cat([obs_features, act_batch], dim=-1)
+            # Detach obs_features so encoder gradient flows only through z,
+            # preventing the decoder from bypassing z via obs_features.
+            enc_input = torch.cat([obs_features.detach(), act_batch], dim=-1)
             h = cvae_encoder(enc_input)
             mu_z = cvae_mu(h)
             logvar_z = cvae_logvar(h)
@@ -301,10 +327,15 @@ def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
             mean_actions = model.actor.mu(latent)
             pred_actions = torch.tanh(mean_actions)
 
-            # Loss: L1 reconstruction + β·KL
+            # Loss: L1 reconstruction + β·KL (with annealing + free bits)
             recon_loss = torch.nn.functional.l1_loss(pred_actions, act_batch)
-            kl_loss = -0.5 * torch.mean(1 + logvar_z - mu_z.pow(2) - logvar_z.exp())
-            loss = recon_loss + beta * kl_loss
+            # KL annealing: β ramps from 0 → beta over first 40% of epochs
+            anneal_frac = min(1.0, epoch / max(1, int(0.4 * epochs)))
+            beta_t = beta * anneal_frac
+            # Free bits: clamp per-dim KL to ≥ 0.25 nats to prevent collapse
+            kl_per_dim = -0.5 * (1 + logvar_z - mu_z.pow(2) - logvar_z.exp())
+            kl_loss = torch.mean(torch.clamp(kl_per_dim, min=0.25))
+            loss = recon_loss + beta_t * kl_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -472,6 +503,60 @@ def inject_layernorm_into_critics(model):
     )
 
     print("LayerNorm + OFN injected into critic networks")
+
+
+def _apply_gru_lr(model, gru_lr):
+    """Recreate actor & critic optimizers with a separate lower LR for GRU parameters.
+
+    Splits parameters into GRU group (gru_lr) and non-GRU group (model.lr_schedule(1)).
+    Safe no-op if the feature extractor has no GRU (e.g. ChunkCVAEFeatureExtractor).
+    """
+    import torch
+
+    if not hasattr(model.actor.features_extractor, 'gru'):
+        return
+
+    base_lr = model.lr_schedule(1)
+
+    def _split_params(module):
+        """Split module parameters into (gru_params, other_params)."""
+        gru_params, other_params = [], []
+        for name, param in module.named_parameters():
+            if '.gru.' in name or name.startswith('gru.'):
+                gru_params.append(param)
+            else:
+                other_params.append(param)
+        return gru_params, other_params
+
+    # Actor optimizer
+    gru_p, other_p = _split_params(model.actor)
+    groups = []
+    if other_p:
+        groups.append({'params': other_p, 'lr': base_lr})
+    if gru_p:
+        groups.append({'params': gru_p, 'lr': gru_lr})
+    model.actor.optimizer = torch.optim.Adam(groups)
+
+    # Critic optimizer
+    gru_p, other_p = _split_params(model.critic)
+    groups = []
+    if other_p:
+        groups.append({'params': other_p, 'lr': base_lr})
+    if gru_p:
+        groups.append({'params': gru_p, 'lr': gru_lr})
+    model.critic.optimizer = torch.optim.Adam(groups)
+
+    # Cost critic optimizer (SafeTQC)
+    if hasattr(model, 'cost_critic') and hasattr(model, 'cost_critic_optimizer'):
+        gru_p, other_p = _split_params(model.cost_critic)
+        groups = []
+        if other_p:
+            groups.append({'params': other_p, 'lr': base_lr})
+        if gru_p:
+            groups.append({'params': gru_p, 'lr': gru_lr})
+        model.cost_critic_optimizer = torch.optim.Adam(groups)
+
+    print(f"GRU learning rate applied: gru_lr={gru_lr}, base_lr={base_lr}")
 
 
 def _inject_layernorm_cost_critic(model):
@@ -1447,6 +1532,8 @@ Examples:
                         help='Number of observations to stack (1 = no stacking, default: 1)')
     parser.add_argument('--gru-hidden', type=int, default=128,
                         help='GRU hidden dimension (only used when --n-frames > 1, default: 128)')
+    parser.add_argument('--gru-lr', type=float, default=1e-5,
+                        help='GRU learning rate (only used when --n-frames > 1, default: 1e-5)')
 
     # Environment arguments
     parser.add_argument('--reward-mode', choices=['dense', 'sparse'], default='dense',
@@ -1543,7 +1630,7 @@ Examples:
     print(f"  CVAE: z_dim={args.cvae_z_dim}, epochs={args.cvae_epochs}, "
           f"beta={args.cvae_beta}, lr={args.cvae_lr}")
     if args.n_frames > 1:
-        print(f"  Frame stacking: n_frames={args.n_frames}, gru_hidden={args.gru_hidden}")
+        print(f"  Frame stacking: n_frames={args.n_frames}, gru_hidden={args.gru_hidden}, gru_lr={args.gru_lr}")
     print(f"  Reward mode: {args.reward_mode}")
     print(f"  Headless: {args.headless}")
     print(f"  Seed: {args.seed}")
@@ -1745,6 +1832,9 @@ Examples:
         # Replace replay buffer with fresh demo buffer (online data is lost)
         model.replay_buffer = replay_buffer
         # LayerNorm + CVAE weights are already baked into the loaded checkpoint
+        # Re-apply separate GRU learning rate (optimizer state is not preserved across resume)
+        if args.n_frames > 1:
+            _apply_gru_lr(model, gru_lr=args.gru_lr)
         print(f"  Model resumed in {_time.time() - _t0:.1f}s")
     else:
         print(f"Creating {algo_name} model...")
@@ -1799,6 +1889,9 @@ Examples:
         # Also inject LayerNorm into cost critic if safe mode
         if args.safe and hasattr(model, 'cost_critic'):
             _inject_layernorm_cost_critic(model)
+        # Apply separate GRU learning rate
+        if args.n_frames > 1:
+            _apply_gru_lr(model, gru_lr=args.gru_lr)
         print(f"  Model created in {_time.time() - _t0:.1f}s")
     print()
 
@@ -1809,6 +1902,7 @@ Examples:
             chunk_size=args.chunk_size, z_dim=args.cvae_z_dim,
             epochs=args.cvae_epochs, batch_size=args.batch_size,
             lr=args.cvae_lr, beta=args.cvae_beta, gamma=args.gamma,
+            gru_lr=args.gru_lr if args.n_frames > 1 else None,
         )
         # Copy pretrained FE weights to cost critic too
         if args.safe and hasattr(model, 'cost_critic'):
