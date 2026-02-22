@@ -434,11 +434,29 @@ class VerboseEpisodeCallback:
                 if total_steps - self._last_report_step >= self._report_interval:
                     elapsed = time.time() - self._start_time if self._start_time else 0
                     rate = total_steps / elapsed if elapsed > 0 else 0
+
+                    # Action stats from last batch
+                    action_str = ""
+                    actions = self.locals.get('actions')
+                    if actions is not None:
+                        act = np.array(actions)
+                        if act.ndim >= 2 and act.shape[-1] >= 2:
+                            action_str = (
+                                f" | act_mean=[{act[...,0].mean():+.3f},{act[...,1].mean():+.3f}]"
+                                f" act_std=[{act[...,0].std():.3f},{act[...,1].std():.3f}]"
+                            )
+
+                    # Entropy coef
+                    ent_str = ""
+                    if hasattr(self.model, 'ent_coef_tensor'):
+                        ent_str = f" | ent={self.model.ent_coef_tensor.item():.5f}"
+
                     print(
                         f"[DEBUG] step={total_steps:>7d} | "
                         f"elapsed={elapsed:.1f}s | "
                         f"rate={rate:.1f} steps/s | "
-                        f"episodes={self._ep_count}",
+                        f"episodes={self._ep_count}"
+                        f"{action_str}{ent_str}",
                         flush=True
                     )
                     self._last_report_step = total_steps

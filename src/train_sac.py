@@ -322,6 +322,11 @@ def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
     for epoch in range(epochs):
         total_recon = 0.0
         total_kl = 0.0
+        _diag_raw_kl_sum = 0.0
+        _diag_mu_abs_sum = 0.0
+        _diag_std_mean_sum = 0.0
+        _diag_active_dims_sum = 0.0
+        _diag_z_abs_sum = 0.0
         n_batches = 0
 
         for obs_batch, act_batch in loader:
@@ -370,10 +375,31 @@ def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
             total_kl += kl_loss.item()
             n_batches += 1
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
+            # Accumulate diagnostics (detached, no grad overhead)
+            with torch.no_grad():
+                _diag_raw_kl_sum += kl_per_dim.mean().item()
+                _diag_mu_abs_sum += mu_z.abs().mean().item()
+                _diag_std_mean_sum += std_z.mean().item()
+                _diag_active_dims_sum += (kl_per_dim.mean(dim=0) > 0.25).float().sum().item()
+                _diag_z_abs_sum += z.abs().mean().item()
+
+        if True:  # log every epoch for diagnostics
+            avg_recon = total_recon / n_batches
+            avg_kl = total_kl / n_batches
+            avg_raw_kl = _diag_raw_kl_sum / n_batches
+            avg_mu_abs = _diag_mu_abs_sum / n_batches
+            avg_std = _diag_std_mean_sum / n_batches
+            avg_active = _diag_active_dims_sum / n_batches
+            avg_z_abs = _diag_z_abs_sum / n_batches
             print(f"  Epoch {epoch+1:4d}/{epochs}, "
-                  f"L1: {total_recon / n_batches:.6f}, "
-                  f"KL: {total_kl / n_batches:.6f}")
+                  f"L1: {avg_recon:.6f}, "
+                  f"KL: {avg_kl:.6f} (raw: {avg_raw_kl:.4f}), "
+                  f"beta_t: {beta_t:.4f}")
+            print(f"         "
+                  f"enc |mu|: {avg_mu_abs:.4f}, "
+                  f"enc std: {avg_std:.4f}, "
+                  f"|z|: {avg_z_abs:.4f}, "
+                  f"active_dims: {avg_active:.1f}/{z_dim}")
 
     # Copy pretrained features_extractor weights → critic and critic_target
     fe_state = model.actor.features_extractor.state_dict()
@@ -2038,7 +2064,7 @@ Examples:
             batch_size=args.batch_size,
             gamma=effective_gamma,
             ent_coef=ent_coef,
-            target_entropy=-2.0,
+            target_entropy="auto",  # -action_dim (e.g. -10 for chunk_size=5)
             gradient_steps=args.utd_ratio,
             learning_starts=args.learning_starts,
             train_freq=1,

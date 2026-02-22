@@ -366,7 +366,7 @@ CVAE pretraining (replaces BC warmstart):
 ### Pipeline Order
 1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
 2. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
-3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-2.0
+3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy="auto" (-action_dim)
 4. Inject LayerNorm into critics (`inject_layernorm_into_critics()`) — skipped for CrossQ (BatchRenorm built-in)
 5. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
 6. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
@@ -469,15 +469,15 @@ Per-test behaviour can still be customised by overriding the instance's `step` a
 ## Reward Function
 
 ### Dense Mode (default)
-- **Goal reached**: +10.0 (terminal)
+- **Goal reached**: +50.0 (terminal)
 - **Collision**: -10.0 (terminal, LiDAR distance < 0.08m)
 - **Distance shaping**: `(prev_dist - curr_dist) * 1.0`
-- **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.1`
+- **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.1` — **only when making forward progress** (`prev_dist > curr_dist`), prevents reward exploitation from circling near the goal
 - **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when min_lidar < 0.3m, gated by goal distance (linearly reduced within 0.5m of goal, zero at goal). Auto-removed when `--safe` is active (handled by cost critic); `--keep-proximity-reward` to override
 - **Time penalty**: -0.005 per step
 
 ### Sparse Mode
-- **Goal reached**: +10.0
+- **Goal reached**: +50.0
 - **Collision**: -10.0
 - **Otherwise**: 0.0
 

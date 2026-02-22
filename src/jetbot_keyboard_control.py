@@ -1145,7 +1145,7 @@ class RewardComputer:
     """
 
     # Reward constants
-    GOAL_REACHED_REWARD = 10.0
+    GOAL_REACHED_REWARD = 50.0
     DISTANCE_SCALE = 1.0
     HEADING_BONUS_SCALE = 0.1
     COLLISION_PENALTY = -10.0
@@ -1208,13 +1208,15 @@ class RewardComputer:
         # Distance-based shaping (reward getting closer to goal)
         prev_dist = obs[8]  # distance to goal
         curr_dist = next_obs[8]
-        reward += (prev_dist - curr_dist) * self.DISTANCE_SCALE
+        progress = prev_dist - curr_dist
+        reward += progress * self.DISTANCE_SCALE
 
-        # Heading bonus (reward facing the goal)
-        # Derive angle_to_goal from body-frame goal: atan2(goal_body_y, goal_body_x)
-        angle_to_goal = abs(np.arctan2(next_obs[7], next_obs[6]))
-        heading_bonus = (np.pi - angle_to_goal) / np.pi  # 1.0 when facing goal, 0.0 when facing away
-        reward += heading_bonus * self.HEADING_BONUS_SCALE
+        # Heading bonus — only when making forward progress
+        # Prevents exploit: circling near goal to collect heading reward without approaching
+        if progress > 0:
+            angle_to_goal = abs(np.arctan2(next_obs[7], next_obs[6]))
+            heading_bonus = (np.pi - angle_to_goal) / np.pi  # 1.0 when facing goal
+            reward += heading_bonus * self.HEADING_BONUS_SCALE
 
         # Proximity penalty (smooth, increases as robot nears obstacle)
         # Gated by goal distance: full penalty far from goal, zero at goal
