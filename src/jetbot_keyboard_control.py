@@ -1211,12 +1211,12 @@ class RewardComputer:
         progress = prev_dist - curr_dist
         reward += progress * self.DISTANCE_SCALE
 
-        # Heading bonus — only when making forward progress
-        # Prevents exploit: circling near goal to collect heading reward without approaching
+        # Heading bonus — scaled by progress magnitude
+        # Prevents exploit: creeping slowly to accumulate per-step heading reward
         if progress > 0:
             angle_to_goal = abs(np.arctan2(next_obs[7], next_obs[6]))
             heading_bonus = (np.pi - angle_to_goal) / np.pi  # 1.0 when facing goal
-            reward += heading_bonus * self.HEADING_BONUS_SCALE
+            reward += heading_bonus * progress * self.HEADING_BONUS_SCALE
 
         # Proximity penalty (smooth, increases as robot nears obstacle)
         # Gated by goal distance: full penalty far from goal, zero at goal
