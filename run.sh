@@ -2,7 +2,7 @@
 # Universal Isaac Sim Python script launcher
 #
 # Usage:
-#   ./run.sh                              # Run jetbot_keyboard_control.py
+#   ./run.sh                             # Run jetbot_keyboard_control.py
 #   ./run.sh --enable-recording          # Run with recording enabled
 #   ./run.sh replay.py demos/file.npz    # Run replay script
 #   ./run.sh train_bc.py demos/file.npz  # Run training script

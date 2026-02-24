@@ -19,11 +19,5 @@ fi
 # Run pytest with all passed arguments
 echo "Running tests with Isaac Sim's Python..."
 $ISAAC_PYTHON -m pytest \
-    src/test_jetbot_keyboard_control.py \
-    src/test_jetbot_rl_env.py \
-    src/test_train_rl.py \
-    src/test_train_sac.py \
-    src/test_train_bc.py \
-    src/test_eval_policy.py \
-    src/test_replay.py \
+    src \
     "$@"
