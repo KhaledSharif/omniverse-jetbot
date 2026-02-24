@@ -1757,7 +1757,7 @@ Examples:
     parser.add_argument('--inflation-radius', type=float, default=0.08,
                         help='Obstacle inflation radius for A* planner in meters (default: 0.08)')
     parser.add_argument('--add-prev-action', action='store_true',
-                        help='Add previous action to observations (34D → 36D)')
+                        help='Add previous action to observations (34D -> 36D)')
 
     # Checkpoint arguments
     parser.add_argument('--checkpoint-freq', type=int, default=50000,
@@ -1939,7 +1939,7 @@ Examples:
     if args.n_frames > 1:
         base_obs_dim = raw_env.observation_space.shape[0]
         raw_env = FrameStackWrapper(raw_env, n_frames=args.n_frames)
-        print(f"  FrameStackWrapper: n_frames={args.n_frames}, obs {base_obs_dim} → {raw_env.observation_space.shape[0]}")
+        print(f"  FrameStackWrapper: n_frames={args.n_frames}, obs {base_obs_dim} -> {raw_env.observation_space.shape[0]}")
     raw_env = ChunkedEnvWrapper(raw_env, chunk_size=args.chunk_size, gamma=args.gamma)
     print(f"  Environment created in {_time.time() - _t0:.1f}s")
     print(f"  Observation space: {raw_env.observation_space.shape}")
@@ -1991,12 +1991,12 @@ Examples:
         }
         demo_rewards_step[_i] = _rc.compute(_obs_i, demo_actions_step[_i], _nobs_i, _info)
     new_mean = float(demo_rewards_step.mean())
-    print(f"  Recomputed demo rewards: mean {old_mean:.4f} → {new_mean:.4f}")
+    print(f"  Recomputed demo rewards: mean {old_mean:.4f} -> {new_mean:.4f}")
 
     # Frame-stack demo observations if using temporal processing
     if args.n_frames > 1:
         from demo_utils import build_frame_stacks
-        print(f"Frame-stacking demo observations: {demo_obs_step.shape[1]}D → "
+        print(f"Frame-stacking demo observations: {demo_obs_step.shape[1]}D -> "
               f"{args.n_frames * demo_obs_step.shape[1]}D")
         demo_obs_step = build_frame_stacks(demo_obs_step, episode_lengths, args.n_frames)
         print(f"  Stacked obs shape: {demo_obs_step.shape}")
@@ -2061,67 +2061,59 @@ Examples:
     _t0 = _time.time()
     if args.resume:
         print(f"Resuming {algo_name} model from {args.resume}...")
-        try:
-            model = algo_cls.load(
-                args.resume,
-                env=env,
-                device=device_str,
-                tensorboard_log=args.tensorboard_log,
-            )
-        except (ValueError, KeyError) as load_err:
-            # Optimizer param-group count mismatch — typically when GRU
-            # split-LR (2 groups) was saved but fresh model has 1 group.
-            # Load network weights only; optimizers are recreated below
-            # by _apply_gru_lr().
-            print(f"  Optimizer state incompatible ({type(load_err).__name__}: {load_err})")
-            print(f"  Loading network weights only (optimizers will be recreated)...")
-            from stable_baselines3.common.save_util import (
-                load_from_zip_file, recursive_getattr,
-            )
-            data, params, pytorch_vars = load_from_zip_file(
-                args.resume, device=device_str,
-            )
-            # Reconstruct model from saved hyperparams (mirrors SB3 load())
-            model = algo_cls(
-                policy=data["policy_class"],
-                env=env,
-                device=device_str,
-                tensorboard_log=args.tensorboard_log,
-                _init_setup_model=False,
-            )
-            model.__dict__.update(data)
-            model._setup_model()
-            # Load only network weights, skip optimizer state dicts
-            state_names, var_names = model._get_torch_save_params()
-            loaded_keys, skipped_keys = [], []
-            for name in state_names:
-                if "optimizer" in name:
-                    skipped_keys.append(name)
-                    continue
-                if name in params:
-                    attr = recursive_getattr(model, name)
+        from stable_baselines3.common.save_util import (
+            load_from_zip_file, recursive_getattr,
+        )
+        data, params, pytorch_vars = load_from_zip_file(
+            args.resume, device=device_str,
+        )
+        # Reconstruct model from saved hyperparams (mirrors SB3 load())
+        model = algo_cls(
+            policy=data["policy_class"],
+            env=env,
+            device=device_str,
+            tensorboard_log=args.tensorboard_log,
+            _init_setup_model=False,
+        )
+        model.__dict__.update(data)
+        model._setup_model()  # creates 1-group optimizers
+        # Re-apply GRU split-LR BEFORE loading optimizer state dicts so the
+        # optimizer structure (2 param groups) matches the checkpoint layout.
+        if args.n_frames > 1:
+            _apply_gru_lr(model, gru_lr=args.gru_lr)
+        # Load all state dicts including optimizers (per-key try/except)
+        state_names, var_names = model._get_torch_save_params()
+        loaded_keys, failed_keys = [], []
+        for name in state_names:
+            if name in params:
+                attr = recursive_getattr(model, name)
+                try:
                     attr.load_state_dict(params[name])
                     loaded_keys.append(name)
-                else:
-                    skipped_keys.append(name + " (missing)")
-            print(f"  Loaded state dicts: {loaded_keys}")
-            print(f"  Skipped state dicts: {skipped_keys}")
-            # Load pytorch variables (log_ent_coef, log_lagrange, etc.)
-            # pytorch_vars is a dict {name: tensor}, not a list
-            if pytorch_vars is not None and isinstance(pytorch_vars, dict):
-                for name in var_names:
-                    if name in pytorch_vars:
-                        attr = recursive_getattr(model, name)
-                        attr.data = pytorch_vars[name]
-                        print(f"  Restored variable: {name} = {pytorch_vars[name].item():.6f}")
-                    else:
-                        print(f"  Variable {name} not in checkpoint, using default")
-            elif pytorch_vars is not None:
-                # Fallback for older SB3 list format
-                for name, val in zip(var_names, pytorch_vars):
+                except (ValueError, RuntimeError) as e:
+                    failed_keys.append(name)
+                    print(f"  Warning: could not load {name}: {e}")
+            else:
+                failed_keys.append(name + " (missing)")
+        print(f"  Loaded state dicts: {loaded_keys}")
+        if failed_keys:
+            print(f"  Failed state dicts: {failed_keys}")
+        # Load pytorch variables (log_ent_coef, log_lagrange, etc.)
+        # pytorch_vars is a dict {name: tensor}, not a list
+        if pytorch_vars is not None and isinstance(pytorch_vars, dict):
+            for name in var_names:
+                if name in pytorch_vars:
                     attr = recursive_getattr(model, name)
-                    attr.data = val
-                    print(f"  Restored variable: {name}")
+                    attr.data = pytorch_vars[name]
+                    print(f"  Restored variable: {name} = {pytorch_vars[name].item():.6f}")
+                else:
+                    print(f"  Variable {name} not in checkpoint, using default")
+        elif pytorch_vars is not None:
+            # Fallback for older SB3 list format
+            for name, val in zip(var_names, pytorch_vars):
+                attr = recursive_getattr(model, name)
+                attr.data = val
+                print(f"  Restored variable: {name}")
         # Verify chunk size matches
         loaded_chunk = model.action_space.shape[0] // 2
         if loaded_chunk != args.chunk_size:
@@ -2148,9 +2140,6 @@ Examples:
         # the new env's _prev_obs as None.
         model._last_obs = None
         # LayerNorm + CVAE weights are already baked into the loaded checkpoint
-        # Re-apply separate GRU learning rate (optimizer state is not preserved across resume)
-        if args.n_frames > 1:
-            _apply_gru_lr(model, gru_lr=args.gru_lr)
         print(f"  Model resumed in {_time.time() - _t0:.1f}s")
     else:
         print(f"Creating {algo_name} model...")
