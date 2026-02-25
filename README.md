@@ -421,7 +421,7 @@ CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at UTD=1 via Bat
 
 *Measured on RTX 3090 Ti, chunk_size=5, headless, batch size 256.*
 
-**Measured step-time breakdown (chunk_size=5):** `world.step()` = 1.3ms · full `env.step()` = 3.0ms · 5-step chunk = 15ms · CrossQ+GRU gradient = ~43ms · total fps≈17 with n-frames=4.
+**Measured step-time breakdown (chunk_size=5):** `world.step()` = 1.3ms · full `env.step()` = 3.0ms · 5-step chunk = 15ms · CrossQ+GRU gradient = **23ms** (measured) · SB3 framework overhead ≈13ms · total ~50ms = ~20 steps/s with n-frames=4.
 
 **Recommendation:** Use CrossQ (default) for fast training. Use `--legacy-tqc --utd-ratio 20` only if you need exact TQC reproduction.
 

@@ -769,6 +769,35 @@ class MeanCostCritic:
         return critic, critic_target
 
 
+def _create_timed_cls(base_cls):
+    """Wrap any SB3 algo class with gradient step timing instrumentation.
+
+    Overrides train() to measure total wall time per gradient step, printing
+    and logging to TensorBoard every 1000 gradient steps.  SafeTQC / DualPolicy
+    have their own detailed timing; wrapping them here has no effect because
+    their train() overrides this one.
+    """
+    class TimedAlgo(base_cls):
+        def train(self, gradient_steps, batch_size=64):
+            import time as _t
+            _t0 = _t.perf_counter()
+            result = super().train(gradient_steps, batch_size)
+            elapsed_ms = (_t.perf_counter() - _t0) * 1000
+            self._timing_n = getattr(self, '_timing_n', 0) + gradient_steps
+            if self._timing_n % 1000 < gradient_steps:
+                _n = max(gradient_steps, 1)
+                print(
+                    f"[TIMING] gradient step: total={elapsed_ms/_n:.1f}ms avg "
+                    f"({self._timing_n} grad steps)",
+                    flush=True,
+                )
+                self.logger.record("timing/grad_total_ms", elapsed_ms / _n)
+            return result
+    TimedAlgo.__name__ = f"Timed{base_cls.__name__}"
+    TimedAlgo.__qualname__ = f"Timed{base_cls.__qualname__}"
+    return TimedAlgo
+
+
 def _create_safe_tqc_class(tqc_base_cls):
     """Create SafeTQC class dynamically to handle TQC import availability.
 
@@ -1941,6 +1970,10 @@ Examples:
     if args.dual_policy and args.safe:
         parser.error("--dual-policy and --safe are mutually exclusive")
 
+    # Always wrap with timing instrumentation (SafeTQC/DualPolicy override train()
+    # with their own detailed timing, so this only fires for plain CrossQ/TQC/SAC)
+    algo_cls = _create_timed_cls(algo_cls)
+
     # Wrap with SafeTQC if --safe
     if args.safe:
         SafeTQC = _create_safe_tqc_class(algo_cls)
@@ -2179,7 +2212,7 @@ Examples:
             old_val = float(model.log_ent_coef.exp())
             with _torch.no_grad():
                 model.log_ent_coef.data.fill_(_math.log(args.ent_coef_init))
-            print(f"  ent_coef reset on resume: {old_val:.5f} → {args.ent_coef_init:.4f}  "
+            print(f"  ent_coef reset on resume: {old_val:.5f} -> {args.ent_coef_init:.4f}  "
                   f"[pass --ent-coef-init 0 to keep checkpoint value]")
         # Replace replay buffer with fresh demo buffer (online data is lost)
         model.replay_buffer = replay_buffer
@@ -2286,14 +2319,14 @@ Examples:
                     ls.weight.data.zero_()
                 else:
                     ls.data.fill_(args.log_std_init)
-            print(f"  log_std reset: -2.0 → {args.log_std_init:.2f} "
-                  f"(std {_math.exp(-2.0):.3f} → {_math.exp(args.log_std_init):.3f}) "
+            print(f"  log_std reset: -2.0 -> {args.log_std_init:.2f} "
+                  f"(std {_math.exp(-2.0):.3f} -> {_math.exp(args.log_std_init):.3f}) "
                   f"  [pass --log-std-init -2.0 to keep CVAE value]")
 
         if args.ent_coef_init > 0 and hasattr(model, 'log_ent_coef'):
             with _torch.no_grad():
                 model.log_ent_coef.data.fill_(_math.log(args.ent_coef_init))
-            print(f"  ent_coef reset: 0.006 → {args.ent_coef_init:.4f} "
+            print(f"  ent_coef reset: 0.006 -> {args.ent_coef_init:.4f} "
                   f"(log_ent_coef={_math.log(args.ent_coef_init):.2f})  "
                   f"[pass --ent-coef-init 0 to disable]")
 

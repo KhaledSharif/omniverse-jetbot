@@ -310,8 +310,9 @@ CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at **UTD=1** via
 - `world.step()` alone: **~1.3ms** per physics tick
 - Full inner `env.step()` (physics + obs build + reward): **~3.0ms**
 - `ChunkedEnvWrapper` total (5 sub-steps, Python overhead): **~15ms** (5 × 3.0ms, overhead≈0)
-- CrossQ gradient step (GRU n-frames=4): **~43ms** (inferred from fps=17: 58ms total − 15ms physics)
+- CrossQ gradient step (GRU n-frames=4): **~23ms** measured (total=23.3ms from `_create_timed_cls` instrumentation)
 - CrossQ gradient step (n-frames=1): **~1ms** (physics dominates at ~15–26ms per chunk)
+- SB3 framework overhead (collection loop, callbacks, TensorBoard, numpy): **~13ms** per step — explains gap between 37ms (physics+grad) and observed ~50ms (20 steps/s)
 
 The `rate=` field in `[DEBUG]` lines is a **cumulative average** (total_steps / total_elapsed), not instantaneous throughput. SB3's `fps` metric is the correct instantaneous rate. The cumulative average is inflated by fast startup phases (CVAE pretraining, demo loading).
 
@@ -403,6 +404,7 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 ### Key Functions & Classes (`src/train_sac.py`)
 - **symlog()**: DreamerV3 symmetric log compression
 - **_set_bn_mode()**: Toggle BatchRenorm training mode if supported (CrossQ only; no-op for TQC/SAC)
+- **_create_timed_cls()**: Wraps any SB3 algo class with a `train()` override that measures total gradient step wall time; applied unconditionally before `--safe`/`--dual-policy` wrapping; SafeTQC/DualPolicy override `train()` and keep their own detailed timing
 - **ChunkCVAEFeatureExtractor.get_class()**: Returns SB3 BaseFeaturesExtractor with split state/lidar MLPs + z-pad
 - **TemporalCVAEFeatureExtractor.get_class()**: Returns GRU-based SB3 feature extractor for frame-stacked observations
 - **pretrain_chunk_cvae()**: CVAE pretraining on demo action chunks; trains feature extractor + actor layers
@@ -510,21 +512,26 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 | `train/current_q_mean` | SafeTQC | Mean current Q estimate |
 | `train/batch_reward_mean` | SafeTQC | Mean reward in sampled batch (demo/online mix) |
 | `train/batch_action_mag` | SafeTQC | Mean |action| in batch |
-| `timing/grad_total_ms` | SafeTQC | Wall time per gradient step (ms) |
-| `timing/grad_critic_ms` | SafeTQC | Critic forward+backward time (ms) |
-| `timing/grad_actor_ms` | SafeTQC | Actor forward+backward time (ms, when policy_delay fires) |
+| `timing/grad_total_ms` | CrossQ + SafeTQC | Wall time per gradient step (ms) |
+| `timing/grad_critic_ms` | SafeTQC only | Critic forward+backward time (ms) |
+| `timing/grad_actor_ms` | SafeTQC only | Actor forward+backward time (ms, when policy_delay fires) |
 
 ### Step-Timing Console Output (`[TIMING]` lines)
 
 ```
-[TIMING] world.step(): 1.31ms avg (1000 calls)
-[TIMING] ChunkedWrapper.step(): total=15.2ms | inner env.step()=3.0ms avg | overhead=0.0ms (chunk_size=5, n=500)
+[TIMING] world.step(): 1.13ms avg (1000 calls)
+[TIMING] ChunkedWrapper.step(): total=13.8ms | inner env.step()=2.8ms avg | overhead=0.0ms (chunk_size=5, n=500)
+# Plain CrossQ (via _create_timed_cls wrapper):
+[TIMING] gradient step: total=23.3ms avg (1000 grad steps)
+# SafeTQC (detailed critic/actor split):
 [TIMING] gradient step: total=43.1ms | critic=38.4ms | actor=4.2ms | other(sample+lagrange+polyak)=0.5ms
 ```
 - `world.step()` prints every 1000 physics calls; `ChunkedWrapper` every 500 wrapper steps; gradient every 1000 gradient steps
 - `inner env.step()` = physics + obs build + reward; `overhead` = Python loop cost (typically ≈0)
-- gradient `other` = buffer sampling + Lagrange update + polyak copy
+- Plain CrossQ timing: total only (no critic/actor split) — `_create_timed_cls` wraps `super().train()`
+- SafeTQC timing: critic/actor split; `other` = buffer sampling + Lagrange update + polyak copy
 - **Caution**: `_time.perf_counter()` in `SafeTQC.train()` uses a local `import time as _t` — module-level `_time` does NOT resolve inside inner classes defined in closures
+- **Caution**: Isaac Sim's Python console uses **cp1252** encoding — Unicode characters like `→` (U+2192) in `print()` cause `UnicodeEncodeError`. Use ASCII `->` in all print statements
 
 ### What to Look For When Debugging
 
@@ -557,6 +564,17 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 - Demo rewards are recomputed with current `RewardComputer` at load time to ensure consistency with online data
 - Prevents stale reward shaping terms (old heading bonus, old goal reward) from corrupting the critic
 - RLPD assumes reward consistency between demo and online transitions; mismatch causes contradictory gradient signals
+
+### Isaac Sim Console Encoding (cp1252)
+Isaac Sim's Python process uses **Windows cp1252** encoding for stdout/stderr. Unicode characters like `→` (U+2192), `±`, `×` in `print()` cause a fatal `UnicodeEncodeError: 'charmap' codec can't encode character` that crashes training immediately. Use ASCII equivalents (`->`, `+/-`, `x`) in all print statements inside scripts run via `run.bat`.
+
+### Corrupted Checkpoint + Large ent_coef Jump → Actor NaN
+Checkpoints saved during unstable training (Q_pi ±20 oscillation, entropy collapse) may contain near-overflow weights. Resuming from such a checkpoint with a large `--ent-coef-init` jump amplifies the gradient and can push the actor to NaN within ~200 gradient steps:
+
+- **Root cause**: Old checkpoint ent_coef ≈ 0.002 → reset to 0.1 = **68× jump**. Actor entropy gradient suddenly dominates; corrupted critic Q-values produce large actor gradients; NaN in `mean_actions` (loc) after <200 steps.
+- **Symptom**: `ValueError: Expected parameter loc ... found invalid values: tensor([[nan, ...]])` early in training.
+- **Fix**: Use an earlier, cleaner checkpoint (before instability) OR reduce `--ent-coef-init 0.01` (2.5× jump instead of 68×). Prefer the cleaner checkpoint — corrupted critic weights can cause instability even with a gentle jump.
+- **Detection**: `policy_std` rising then sudden NaN = gradient explosion. `policy_std` stable but oscillating Q_pi = critic corruption without NaN (safer, may recover).
 
 ### CVAE Beta Selection
 - `--cvae-beta 0.1` (default) works well for deterministic demos
