@@ -299,14 +299,23 @@ The RL training pipeline uses SB3's `VecNormalize` to z-score normalize observat
 
 CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at **UTD=1** via BatchRenorm in critics and no target networks. This eliminates the gradient bottleneck:
 
-| Algorithm | UTD | n-frames | Steps/s | Time for 1M steps | Speedup |
+| Algorithm | UTD | n-frames | Steps/s | 1M Steps Wall Time | Speedup |
 |-----------|-----|----------|---------|-------------------|---------|
 | TQC       | 20  | 1        | ~2.9    | ~4 days           | 1x      |
 | TQC       | 5   | 1        | ~10-12  | ~24 hours         | ~4x     |
 | CrossQ    | 1   | 1        | ~35-39  | ~7 hours          | ~13x    |
-| CrossQ    | 1   | 4 (GRU)  | ~10     | ~28 hours         | ~3.5x   |
+| CrossQ    | 1   | 4 (GRU)  | ~17     | ~16 hours         | ~6x     |
 
-The env step itself (`world.step()`) takes only ~25ms. TQC@UTD=20 adds ~330ms of gradient computation per step.
+**Measured step-time breakdown (chunk_size=5, headless, RTX 3090 Ti):**
+- `world.step()` alone: **~1.3ms** per physics tick
+- Full inner `env.step()` (physics + obs build + reward): **~3.0ms**
+- `ChunkedEnvWrapper` total (5 sub-steps, Python overhead): **~15ms** (5 × 3.0ms, overhead≈0)
+- CrossQ gradient step (GRU n-frames=4): **~43ms** (inferred from fps=17: 58ms total − 15ms physics)
+- CrossQ gradient step (n-frames=1): **~1ms** (physics dominates at ~15–26ms per chunk)
+
+The `rate=` field in `[DEBUG]` lines is a **cumulative average** (total_steps / total_elapsed), not instantaneous throughput. SB3's `fps` metric is the correct instantaneous rate. The cumulative average is inflated by fast startup phases (CVAE pretraining, demo loading).
+
+TQC@UTD=20 adds ~330ms of gradient computation per wrapper step (20 × ~16ms per gradient step).
 
 **Recommendation:** Use CrossQ (default) for ~13x speedup. Use `--legacy-tqc --utd-ratio 20` only if you need exact TQC reproduction.
 
@@ -387,8 +396,9 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 4. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-k (one nat per chunk step; matches RLPD's `-dim(A)/2` heuristic for correlated chunked actions; avoids entropy collapse with tanh squashing)
 5. Inject LayerNorm into critics (`inject_layernorm_into_critics()`) — skipped for CrossQ (BatchRenorm built-in)
 6. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
-7. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
-8. Train with CrossQ/TQC/SAC (no auxiliary callback needed — CVAE encoder is discarded)
+7. **Reset `log_std` and `ent_coef` after CVAE** (critical — see entropy pitfall below): CVAE sets `log_std.bias=-2.0` (std=0.135) and `ent_coef_init=0.006`. This collapses entropy below `target_entropy` before SAC starts. Reset `log_std` to -0.5 and `ent_coef` to 0.1 via `--log-std-init -0.5 --ent-coef-init 0.1` (now default).
+8. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
+9. Train with CrossQ/TQC/SAC (no auxiliary callback needed — CVAE encoder is discarded)
 
 ### Key Functions & Classes (`src/train_sac.py`)
 - **symlog()**: DreamerV3 symmetric log compression
@@ -421,6 +431,8 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 | `--cvae-epochs` | 100 | CVAE pretraining epochs |
 | `--cvae-beta` | 0.1 | CVAE KL weight |
 | `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
+| `--log-std-init` | -0.5 | Actor log_std after CVAE (fresh start). CVAE sets -2.0 (std=0.135) which collapses entropy before SAC starts; -0.5 (std=0.61) gives SAC room to explore. Use -2.0 to keep CVAE value. |
+| `--ent-coef-init` | 0.1 | ent_coef to set after CVAE pretraining or on resume. CVAE/checkpoint may leave ent_coef near 0.006 giving negligible entropy bonus vs Q-values. Applied on both fresh start and `--resume`; pass 0 to disable. |
 | `--safe` | off | Enable SafeTQC (cost critic + Lagrange) |
 | `--cost-limit` | 25.0 | Per-episode cost budget |
 | `--lagrange-lr` | 3e-4 | Lagrange multiplier learning rate |
@@ -498,6 +510,21 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 | `train/current_q_mean` | SafeTQC | Mean current Q estimate |
 | `train/batch_reward_mean` | SafeTQC | Mean reward in sampled batch (demo/online mix) |
 | `train/batch_action_mag` | SafeTQC | Mean |action| in batch |
+| `timing/grad_total_ms` | SafeTQC | Wall time per gradient step (ms) |
+| `timing/grad_critic_ms` | SafeTQC | Critic forward+backward time (ms) |
+| `timing/grad_actor_ms` | SafeTQC | Actor forward+backward time (ms, when policy_delay fires) |
+
+### Step-Timing Console Output (`[TIMING]` lines)
+
+```
+[TIMING] world.step(): 1.31ms avg (1000 calls)
+[TIMING] ChunkedWrapper.step(): total=15.2ms | inner env.step()=3.0ms avg | overhead=0.0ms (chunk_size=5, n=500)
+[TIMING] gradient step: total=43.1ms | critic=38.4ms | actor=4.2ms | other(sample+lagrange+polyak)=0.5ms
+```
+- `world.step()` prints every 1000 physics calls; `ChunkedWrapper` every 500 wrapper steps; gradient every 1000 gradient steps
+- `inner env.step()` = physics + obs build + reward; `overhead` = Python loop cost (typically ≈0)
+- gradient `other` = buffer sampling + Lagrange update + polyak copy
+- **Caution**: `_time.perf_counter()` in `SafeTQC.train()` uses a local `import time as _t` — module-level `_time` does NOT resolve inside inner classes defined in closures
 
 ### What to Look For When Debugging
 
@@ -506,6 +533,8 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 | High collision rate (>50%) | Agent ignores LiDAR | `act=[lin,ang]` — high angular = spinning; `min_lidar` pattern |
 | 0% success rate after 50k steps | Goal reward too weak or agent can't navigate | `gd` — if decreasing, agent approaches but fails; if flat, agent wanders |
 | `ent_coef` monotonically decreasing | Entropy death spiral, target_entropy too aggressive | Compare policy entropy `H` vs target_entropy; should stabilize |
+| `ent_coef` oscillating near 0.002, entropy swings ±10 nats | CVAE collapsed log_std + insufficient ent_coef_init | Add `--log-std-init -0.5 --ent-coef-init 0.1`; reset on resume too |
+| Q_pi swings ±20 in 3000 steps without diverging | Entropy collapse triggering sharp actor updates + BatchRenorm distribution shock | Fix entropy first (`--ent-coef-init 0.1`); optionally freeze actor 5k steps after resume |
 | `ent_coef` monotonically increasing | Policy too deterministic | `policy_std` — if pinned near initial value, CVAE overtightened |
 | Q_pi values growing unboundedly | Critic overestimation | `train/target_q_mean` — should stabilize; if growing > 1000, problem |
 | Returns high but SR=0% | Reward exploitation (distance shaping) | Check if truncated episodes dominate; heading bonus is gated by progress |
@@ -543,11 +572,36 @@ The reward constants are tuned to maintain a clear penalty hierarchy:
 - Potential-based shaping (Ng et al., 1999) is provably unexploitable: orbiting at fixed distance gives 0, oscillating in/out cancels. Only net approach toward goal yields reward
 - **Heading bonus (0.5)** is gated by forward progress (`prev_dist > curr_dist`), so it's proportional to `progress * alignment` — can't be exploited by slow creeping or circling
 
-### Post-CVAE Entropy Coefficient
-- CVAE pretraining tightens `log_std` to -2.0 (std~0.135), initial `ent_coef=0.006`
-- With `target_entropy=-chunk_size`, ent_coef should gently increase (0.006→0.01+) as SAC encourages exploration
-- If ent_coef drops monotonically → target_entropy too aggressive (death spiral)
-- Healthy sign: `policy_std` slowly increasing from 0.135 → 0.15-0.20 over first 10k steps
+### CVAE Entropy Death Spiral + Q Instability (Critical)
+
+**Root cause (confirmed via instrumentation, 2026-02-25):**
+
+CVAE pretraining sets `log_std.bias = -2.0` (std=0.135). For a 10D tanh-squashed policy, this puts entropy at ≈ -6 to -10 nats — already **below** `target_entropy=-chunk_size` before SAC starts. With `ent_coef_init=0.006`, the actor entropy bonus is `0.006 × (-10) = -0.06`, which is ~200× weaker than Q-values (±10–20). The actor ignores entropy entirely, making sharp greedy updates. On `--resume`, the checkpoint's collapsed ent_coef (~0.002) is restored, making the problem worse.
+
+**Without the fix, a death spiral occurs:**
+1. CVAE policy already below target entropy → SAC auto-tuner tries to increase ent_coef
+2. But ent_coef too small → entropy bonus negligible → actor stays deterministic
+3. Near-deterministic policy makes sharp Q updates → critic diverges → Q oscillates
+4. Q oscillation with no entropy regularization → ±20 Q swings in 3000 steps (observed)
+5. `ent_coef` oscillates around zero, never stabilizing
+
+**Fix (now default via `--log-std-init -0.5 --ent-coef-init 0.1`):**
+- Reset `log_std.bias` from -2.0 → -0.5 (std 0.135 → 0.61) after CVAE: preserves learned action means, gives SAC room to tune variance
+- Reset `ent_coef` from 0.006 → 0.1 after CVAE or on resume: entropy bonus `0.1 × (-10) = -1.0` is now non-trivial vs Q-values
+- On resume: `log_ent_coef` tensor is explicitly overwritten (SB3 restores it from checkpoint otherwise)
+
+**Root cause for Q oscillation (separately):**
+- Post-resume distribution shock: BatchRenorm running stats calibrated at checkpoint time see shifted distribution from new online data
+- Action chunking (k=5 → 10D action space) amplifies any critic overestimation episode
+- CrossQ three-distribution mixing (demo / old-online / new-online) breaks the two-distribution BatchRenorm assumption (CrossQ paper only analyzes two distributions)
+- Fix: `--ent-coef-init 0.1` breaks the death spiral; a 5k-step frozen-actor warmup after resume would further stabilize BatchRenorm stats
+
+**Healthy post-fix signs:**
+- `policy_std` slowly rising 0.61 → 0.65+ over first 5k steps
+- `ent_coef` starting ~0.1, gently adjusting toward equilibrium
+- `Q_pi` varying ≤ ±5 units over 1000 steps (not ±20)
+
+**References:** RLPD (Ball et al., ICML 2023), CrossQ (Bhatt et al., ICLR 2024), "Understanding Q-Value Divergence in Offline-RL" (Zheng et al., NeurIPS 2023), "Scaling CrossQ with Weight Normalization" (Palo et al., arXiv 2506.03758)
 
 ## Testing
 

@@ -24,6 +24,7 @@ WheeledRobot = None
 DifferentialController = None
 get_assets_root_path = None
 
+import time
 import numpy as np
 
 # Import gymnasium
@@ -190,6 +191,10 @@ class JetbotNavigationEnv(gymnasium.Env):
         self._current_linear_vel = 0.0
         self._current_angular_vel = 0.0
         self._prev_action = np.zeros(2, dtype=np.float32)
+
+        # Timing accumulators for physics step profiling
+        self._wstep_ms_acc = 0.0
+        self._wstep_n = 0
 
     def _init_isaac_sim(self):
         """Initialize Isaac Sim simulation environment."""
@@ -401,7 +406,17 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.jetbot.apply_wheel_actions(wheel_actions)
 
         # Step simulation
+        _wt0 = time.perf_counter()
         self.world.step(render=not self.headless)
+        self._wstep_ms_acc += (time.perf_counter() - _wt0) * 1000
+        self._wstep_n += 1
+        if self._wstep_n % 1000 == 0:
+            print(
+                f"[TIMING] world.step(): {self._wstep_ms_acc / self._wstep_n:.2f}ms avg "
+                f"({self._wstep_n} calls)", flush=True
+            )
+            self._wstep_ms_acc = 0.0
+            self._wstep_n = 0
 
         # Increment step counter
         self._step_count += 1
@@ -600,6 +615,11 @@ class ChunkedEnvWrapper(gymnasium.Wrapper):
             low=low, high=high, dtype=env.action_space.dtype
         )
 
+        # Timing accumulators for chunk step profiling
+        self._chunk_ms_acc = 0.0
+        self._substep_ms_acc = 0.0
+        self._chunk_n = 0
+
     def step(self, action_flat):
         """Execute k inner steps with the action chunk.
 
@@ -618,12 +638,31 @@ class ChunkedEnvWrapper(gymnasium.Wrapper):
         obs = None
         info = {}
 
+        _chunk_t0 = time.perf_counter()
         for i, act in enumerate(actions):
+            _sub_t0 = time.perf_counter()
             obs, reward, terminated, truncated, info = self.env.step(act)
+            self._substep_ms_acc += (time.perf_counter() - _sub_t0) * 1000
             r_chunk += (self.gamma ** i) * reward
             c_chunk += (self.gamma ** i) * info.get('cost', 0.0)
             if terminated or truncated:
                 break
+
+        self._chunk_ms_acc += (time.perf_counter() - _chunk_t0) * 1000
+        self._chunk_n += 1
+        if self._chunk_n % 500 == 0:
+            _chunk_avg = self._chunk_ms_acc / self._chunk_n
+            _sub_avg = self._substep_ms_acc / (self._chunk_n * self.chunk_size)
+            print(
+                f"[TIMING] ChunkedWrapper.step(): total={_chunk_avg:.1f}ms | "
+                f"inner env.step()={_sub_avg:.1f}ms avg | "
+                f"overhead={_chunk_avg - _sub_avg * self.chunk_size:.1f}ms "
+                f"(chunk_size={self.chunk_size}, n={self._chunk_n})",
+                flush=True,
+            )
+            self._chunk_ms_acc = 0.0
+            self._substep_ms_acc = 0.0
+            self._chunk_n = 0
 
         info['cost_chunk'] = c_chunk
         return obs, r_chunk, terminated, truncated, info

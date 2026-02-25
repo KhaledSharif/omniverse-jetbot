@@ -196,9 +196,9 @@ isaac-sim-jetbot-keyboard/
 ./run.sh train_sac.py --demos demos/recording.npz --headless \
   --cvae-epochs 200 --cvae-beta 0.05 --cvae-z-dim 16
 
-# Resume training from checkpoint
+# Resume training from checkpoint (--ent-coef-init resets collapsed ent_coef from checkpoint)
 ./run.sh train_sac.py --demos demos/recording.npz --headless \
-  --resume models/checkpoints/crossq_jetbot_50000_steps.zip --timesteps 500000
+  --resume models/checkpoints/crossq_jetbot_50000_steps.zip --timesteps 500000 --ent-coef-init 0.1
 
 # SafeTQC: constrained RL with cost critic + Lagrange multiplier
 ./run.sh train_sac.py --demos demos/recording.npz --headless --safe
@@ -257,6 +257,8 @@ ChunkCVAEFeatureExtractor (dynamic split: state_dim = obs_dim - 24):
 | `--cvae-beta` | 0.1 | CVAE KL weight |
 | `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
 | `--demo-ratio` | 0.5 | Fraction of batch from demos |
+| `--log-std-init` | -0.5 | Actor log_std after CVAE. CVAE sets -2.0 (std=0.135) collapsing entropy before SAC starts; -0.5 (std=0.61) gives SAC room to explore. Use -2.0 to keep CVAE value. |
+| `--ent-coef-init` | 0.1 | ent_coef set after CVAE pretraining and on `--resume`. CVAE/checkpoint may leave ent_coef ≈0.006 (entropy bonus negligible vs Q-values). Use 0 to disable. |
 
 #### SafeTQC: Constrained RL with Lagrange Multiplier
 
@@ -410,13 +412,16 @@ tensorboard --logdir runs/
 
 CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at UTD=1 via BatchRenorm in critics and no target networks, providing a ~13x speedup:
 
-| Algorithm | UTD | Steps/s | 1M Steps Wall Time | Speedup |
-|-----------|-----|---------|---------------------|---------|
-| TQC       | 20  | ~3      | ~4 days             | 1x      |
-| TQC       | 5   | ~10-12  | ~24 hours           | ~4x     |
-| **CrossQ**| **1** | **~35-39** | **~7 hours**    | **~13x** |
+| Algorithm | UTD | n-frames | Steps/s | 1M Steps Wall Time | Speedup |
+|-----------|-----|----------|---------|---------------------|---------|
+| TQC       | 20  | 1        | ~3      | ~4 days             | 1x      |
+| TQC       | 5   | 1        | ~10-12  | ~24 hours           | ~4x     |
+| **CrossQ**| **1** | **1** | **~35-39** | **~7 hours**  | **~13x** |
+| CrossQ    | 1   | 4 (GRU)  | ~17     | ~16 hours           | ~6x     |
 
-*Measured on RTX 3090 Ti, 50 obstacles, headless, batch size 256.*
+*Measured on RTX 3090 Ti, chunk_size=5, headless, batch size 256.*
+
+**Measured step-time breakdown (chunk_size=5):** `world.step()` = 1.3ms · full `env.step()` = 3.0ms · 5-step chunk = 15ms · CrossQ+GRU gradient = ~43ms · total fps≈17 with n-frames=4.
 
 **Recommendation:** Use CrossQ (default) for fast training. Use `--legacy-tqc --utd-ratio 20` only if you need exact TQC reproduction.
 

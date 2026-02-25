@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import time as _time
 import numpy as np
 from pathlib import Path
 
@@ -834,6 +835,7 @@ def _create_safe_tqc_class(tqc_base_cls):
             self._cost_limit_per_step = self._cost_limit / self._max_episode_steps
 
         def train(self, gradient_steps, batch_size=64):
+            import time as _t  # local import — avoids LEGB closure issues with inner classes
             # Switch to train mode
             self.policy.set_training_mode(True)
             is_crossq = _is_crossq_model(self)
@@ -852,7 +854,13 @@ def _create_safe_tqc_class(tqc_base_cls):
             _diag_target_q, _diag_current_q = [], []
             _diag_batch_reward, _diag_batch_action_mag = [], []
 
+            # Per-call timing accumulators
+            _ta_total = 0.0
+            _ta_critic = 0.0
+            _ta_actor = 0.0
+
             for _ in range(gradient_steps):
+                _t_iter0 = _t.perf_counter()
                 if is_crossq:
                     self._n_updates += 1
 
@@ -873,6 +881,7 @@ def _create_safe_tqc_class(tqc_base_cls):
                 ent_coefs.append(ent_coef.item())
 
                 # --- Reward critic update ---
+                _t_critic0 = _t.perf_counter()
                 with torch.no_grad():
                     _set_bn_mode(self.actor, False)
                     next_actions, next_log_prob = self.actor.action_log_prob(
@@ -1022,6 +1031,7 @@ def _create_safe_tqc_class(tqc_base_cls):
                 self.critic.optimizer.zero_grad()
                 critic_loss.backward()
                 self.critic.optimizer.step()
+                _ta_critic += (_t.perf_counter() - _t_critic0) * 1000
 
                 # --- Cost critic update ---
                 if cost_data is not None:
@@ -1050,6 +1060,7 @@ def _create_safe_tqc_class(tqc_base_cls):
 
                 # --- Actor + entropy update (gated by policy_delay for CrossQ) ---
                 if self._n_updates % policy_delay == 0 or not is_crossq:
+                    _t_actor0 = _t.perf_counter()
                     _set_bn_mode(self.actor, True)
                     actions_pi, log_prob = self.actor.action_log_prob(
                         replay_data.observations
@@ -1115,6 +1126,7 @@ def _create_safe_tqc_class(tqc_base_cls):
                     self.actor.optimizer.zero_grad()
                     actor_loss.backward()
                     self.actor.optimizer.step()
+                    _ta_actor += (_t.perf_counter() - _t_actor0) * 1000
 
                 # --- Lagrange multiplier update ---
                 if cost_data is not None:
@@ -1144,6 +1156,23 @@ def _create_safe_tqc_class(tqc_base_cls):
                         self.cost_critic_target.parameters(),
                         _cost_tau
                     )
+                _ta_total += (_t.perf_counter() - _t_iter0) * 1000
+
+            # Timing: print + log to TensorBoard every 1000 gradient steps
+            self._timing_n = getattr(self, '_timing_n', 0) + gradient_steps
+            if self._timing_n % 1000 < gradient_steps:
+                _n = max(gradient_steps, 1)
+                _other = max(0.0, _ta_total / _n - _ta_critic / _n - _ta_actor / _n)
+                print(
+                    f"[TIMING] gradient step: total={_ta_total/_n:.1f}ms | "
+                    f"critic={_ta_critic/_n:.1f}ms | "
+                    f"actor={_ta_actor/_n:.1f}ms | "
+                    f"other(sample+lagrange+polyak)={_other:.1f}ms",
+                    flush=True,
+                )
+                self.logger.record("timing/grad_total_ms", _ta_total / _n)
+                self.logger.record("timing/grad_critic_ms", _ta_critic / _n)
+                self.logger.record("timing/grad_actor_ms", _ta_actor / _n)
 
             # Logging
             if not is_crossq:
@@ -1714,6 +1743,15 @@ Examples:
                         help='Actor update delay (default: 1; CrossQ paper uses 20 with UTD=20)')
     parser.add_argument('--ent-coef', type=str, default='auto_0.006',
                         help='Entropy coefficient, "auto" or "auto_<init>" for learned (default: auto_0.006)')
+    parser.add_argument('--log-std-init', type=float, default=-0.5,
+                        help='Actor log_std after CVAE pretraining. CVAE sets -2.0 (std=0.135) which '
+                             'collapses SAC entropy. -0.5 (std=0.61) gives SAC room to explore. '
+                             'Only applies on fresh start, not --resume. (default: -0.5)')
+    parser.add_argument('--ent-coef-init', type=float, default=0.1,
+                        help='ent_coef value to set after CVAE pretraining or on resume. '
+                             'CVAE leaves ent_coef too small (~0.006) giving negligible entropy '
+                             'bonus vs Q-values. 0.1 gives meaningful regularization. '
+                             '(default: 0.1, set 0 to disable)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (default: 42)')
     parser.add_argument('--learning-starts', type=int, default=0,
@@ -2133,6 +2171,16 @@ Examples:
             model.tau = args.tau
         model.gradient_steps = args.utd_ratio
         model.ent_coef = ent_coef
+        # On resume: the checkpoint may have a collapsed ent_coef (~0.002) from a previous
+        # entropy death spiral. Explicitly reset if --ent-coef-init > 0.
+        if args.ent_coef_init > 0 and hasattr(model, 'log_ent_coef'):
+            import math as _math
+            import torch as _torch
+            old_val = float(model.log_ent_coef.exp())
+            with _torch.no_grad():
+                model.log_ent_coef.data.fill_(_math.log(args.ent_coef_init))
+            print(f"  ent_coef reset on resume: {old_val:.5f} → {args.ent_coef_init:.4f}  "
+                  f"[pass --ent-coef-init 0 to keep checkpoint value]")
         # Replace replay buffer with fresh demo buffer (online data is lost)
         model.replay_buffer = replay_buffer
         # Force initial env.reset() — __dict__.update(data) restores a stale
@@ -2221,6 +2269,33 @@ Examples:
             model.cost_critic.features_extractor.load_state_dict(fe_state)
             model.cost_critic_target.features_extractor.load_state_dict(fe_state)
             print("  Feature extractor weights copied to cost critic/cost_critic_target")
+
+        # --- Post-CVAE entropy fixes ---
+        # CVAE pretraining sets log_std.bias=-2.0 (std=0.135) which collapses entropy below
+        # target_entropy before SAC even starts. With ent_coef~0.006 the entropy bonus is
+        # ~0.006*(-10)=-0.06, negligible vs Q-values of ±10-20. Both must be reset.
+        # (RLPD, Ball et al. ICML 2023: "standard ent_coef init fails when policy is near-deterministic")
+        import math as _math
+        import torch as _torch
+
+        if args.log_std_init != -2.0:  # -2.0 = keep CVAE value
+            with _torch.no_grad():
+                ls = model.actor.log_std
+                if hasattr(ls, 'bias'):
+                    ls.bias.data.fill_(args.log_std_init)
+                    ls.weight.data.zero_()
+                else:
+                    ls.data.fill_(args.log_std_init)
+            print(f"  log_std reset: -2.0 → {args.log_std_init:.2f} "
+                  f"(std {_math.exp(-2.0):.3f} → {_math.exp(args.log_std_init):.3f}) "
+                  f"  [pass --log-std-init -2.0 to keep CVAE value]")
+
+        if args.ent_coef_init > 0 and hasattr(model, 'log_ent_coef'):
+            with _torch.no_grad():
+                model.log_ent_coef.data.fill_(_math.log(args.ent_coef_init))
+            print(f"  ent_coef reset: 0.006 → {args.ent_coef_init:.4f} "
+                  f"(log_ent_coef={_math.log(args.ent_coef_init):.2f})  "
+                  f"[pass --ent-coef-init 0 to disable]")
 
     # Freeze IL actor for dual-policy (IBRL)
     if args.dual_policy:
