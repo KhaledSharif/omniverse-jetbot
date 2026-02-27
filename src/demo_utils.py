@@ -424,6 +424,8 @@ class VerboseEpisodeCallback:
                 self._ep_actions_lin = []   # |linear_vel| per step
                 self._ep_actions_ang = []   # |angular_vel| per step
                 self._ep_goal_dist = None   # goal distance at episode end
+                self._ep_min_goal_dist = float('inf')  # closest to goal during episode
+                self._ep_near_goal_steps = 0           # steps with gd < 0.5m
                 self._diag_interval = 500   # Q-value probe interval
                 # Rolling stats (last 20 episodes)
                 from collections import deque
@@ -472,10 +474,21 @@ class VerboseEpisodeCallback:
                     except Exception:
                         pass
 
-                    # Entropy coef
+                    # Entropy coef (try log_ent_coef first — CrossQ stores it there)
                     ent_str = ""
-                    if hasattr(self.model, 'ent_coef_tensor'):
-                        ent_str = f" | ent={self.model.ent_coef_tensor.item():.5f}"
+                    try:
+                        import torch as _th2
+                        with _th2.no_grad():
+                            if hasattr(self.model, 'log_ent_coef'):
+                                _ec = float(self.model.log_ent_coef.exp())
+                            elif hasattr(self.model, 'ent_coef_tensor'):
+                                _ec = float(self.model.ent_coef_tensor.item())
+                            else:
+                                _ec = None
+                        if _ec is not None:
+                            ent_str = f" | ent_coef={_ec:.5f}"
+                    except Exception:
+                        pass
 
                     print(
                         f"[DEBUG] step={total_steps:>7d} | "
@@ -492,29 +505,40 @@ class VerboseEpisodeCallback:
                     try:
                         import torch as _th
                         with _th.no_grad():
-                            obs_t = _th.as_tensor(
-                                self.locals['new_obs'],
-                                dtype=_th.float32,
-                                device=self.model.device,
-                            )
-                            act_pi, log_prob = self.model.actor.action_log_prob(obs_t)
-                            q_vals = self.model.critic(obs_t, act_pi)
+                            # Sample from replay buffer for diverse Q probe
+                            # (single new_obs gives min=mean=max; buffer gives spread)
+                            buf = self.model.replay_buffer
+                            buf_online = buf.size() if hasattr(buf, 'size') else 0
+                            n_demos = getattr(buf, 'n_demos', 0)
+                            buf_cap = getattr(buf, 'buffer_size', 0)
+                            obs_probe = None
+                            try:
+                                if buf_online + n_demos >= 32:
+                                    rb_sample = buf.sample(32)
+                                    obs_probe = rb_sample.observations
+                            except Exception:
+                                obs_probe = None
+                            if obs_probe is None:
+                                obs_probe = _th.as_tensor(
+                                    self.locals['new_obs'],
+                                    dtype=_th.float32,
+                                    device=self.model.device,
+                                )
+
+                            act_pi, log_prob = self.model.actor.action_log_prob(obs_probe)
+                            q_vals = self.model.critic(obs_probe, act_pi)
                             if isinstance(q_vals, (list, tuple)):
                                 q_cat = _th.cat(q_vals, dim=1)
                                 q_mean = q_cat.mean().item()
                                 q_min_v = q_cat.min().item()
                                 q_max_v = q_cat.max().item()
+                                q_std = q_cat.std().item()
                             else:
                                 q_mean = q_vals.mean().item()
                                 q_min_v = q_vals.min().item()
                                 q_max_v = q_vals.max().item()
+                                q_std = q_vals.std().item()
                             entropy = -log_prob.mean().item()
-
-                            # Buffer fill
-                            buf = self.model.replay_buffer
-                            buf_online = buf.size() if hasattr(buf, 'size') else 0
-                            n_demos = getattr(buf, 'n_demos', 0)
-                            buf_cap = getattr(buf, 'buffer_size', 0)
 
                             # Log to TensorBoard
                             self.model.logger.record(
@@ -524,14 +548,17 @@ class VerboseEpisodeCallback:
                             self.model.logger.record(
                                 "diag/Q_pi_max", q_max_v)
                             self.model.logger.record(
+                                "diag/Q_pi_std", q_std)
+                            self.model.logger.record(
                                 "diag/policy_entropy", entropy)
                             self.model.logger.record(
                                 "diag/buffer_online", buf_online)
 
+                            src = "buf" if obs_probe.shape[0] == 32 else "obs"
                             print(
                                 f"[DIAG]  step={total_steps:>7d} | "
-                                f"Q_pi=[{q_min_v:+.1f}, {q_mean:+.1f}, "
-                                f"{q_max_v:+.1f}] | "
+                                f"Q_pi([{src}32])=[{q_min_v:+.1f}, {q_mean:+.1f}, "
+                                f"{q_max_v:+.1f}] std={q_std:.2f} | "
                                 f"H={entropy:+.2f} | "
                                 f"buf={buf_online}/{buf_cap} "
                                 f"demos={n_demos}",
@@ -554,6 +581,12 @@ class VerboseEpisodeCallback:
                     # Track goal distance and actions for diagnostics
                     self._ep_goal_dist = info.get(
                         'goal_distance', self._ep_goal_dist)
+                    _gd_now = info.get('goal_distance')
+                    if _gd_now is not None:
+                        if _gd_now < self._ep_min_goal_dist:
+                            self._ep_min_goal_dist = _gd_now
+                        if _gd_now < 0.5:
+                            self._ep_near_goal_steps += 1
                     actions = self.locals.get('actions')
                     if actions is not None:
                         act = np.asarray(
@@ -584,9 +617,14 @@ class VerboseEpisodeCallback:
                         sr = self._total_successes / self._ep_count * 100
                         elapsed = time.time() - self._start_time if self._start_time else 0
 
-                        # Goal distance at episode end
+                        # Goal distance at episode end + min during episode
                         gd = self._ep_goal_dist
                         gd_str = f" | gd={gd:.2f}m" if gd is not None else ""
+                        min_gd = self._ep_min_goal_dist
+                        min_gd_str = (f" | min_gd={min_gd:.2f}m"
+                                      if min_gd < float('inf') else "")
+                        near_str = (f" | near={self._ep_near_goal_steps}"
+                                    if self._ep_near_goal_steps > 0 else "")
 
                         # Action stats for this episode
                         act_str = ""
@@ -601,7 +639,7 @@ class VerboseEpisodeCallback:
                             f"steps={self._ep_steps:3d} | "
                             f"return={self._ep_reward:+7.2f} | "
                             f"min_lidar={self._ep_min_lidar:.3f}m"
-                            f"{gd_str}{act_str} | "
+                            f"{gd_str}{min_gd_str}{near_str}{act_str} | "
                             f"running SR={sr:.1f}% "
                             f"({self._total_successes}S/"
                             f"{self._total_collisions}C/"
@@ -627,6 +665,10 @@ class VerboseEpisodeCallback:
                                       self._ep_min_lidar)
                             if gd is not None:
                                 lg.record("rollout/ep_goal_dist", gd)
+                            if min_gd < float('inf'):
+                                lg.record("rollout/ep_min_goal_dist", min_gd)
+                            lg.record("rollout/ep_near_goal_steps",
+                                      self._ep_near_goal_steps)
                             n_r = len(self._recent_returns)
                             if n_r > 0:
                                 lg.record("rollout/return_20ep",
@@ -697,6 +739,8 @@ class VerboseEpisodeCallback:
                         self._ep_steps = 0
                         self._ep_min_lidar = float('inf')
                         self._ep_goal_dist = None
+                        self._ep_min_goal_dist = float('inf')
+                        self._ep_near_goal_steps = 0
                         self._ep_actions_lin = []
                         self._ep_actions_ang = []
 
