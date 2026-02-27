@@ -842,6 +842,12 @@ def _create_timed_cls(base_cls):
                     flush=True,
                 )
                 self.logger.record("timing/grad_total_ms", elapsed_ms / _n)
+            # Enforce ent_coef floor for plain CrossQ/SAC (SafeTQC/DualPolicy
+            # have their own floor in their train() overrides).
+            _ent_min = getattr(self, '_ent_coef_min', 0.0)
+            if _ent_min > 0 and hasattr(self, 'log_ent_coef') and self.log_ent_coef is not None:
+                import math as _math
+                self.log_ent_coef.data.clamp_(min=_math.log(_ent_min))
             return result
     TimedAlgo.__name__ = f"Timed{base_cls.__name__}"
     TimedAlgo.__qualname__ = f"Timed{base_cls.__qualname__}"
@@ -1912,6 +1918,12 @@ Examples:
     stab_group.add_argument('--ent-coef-min', type=float, default=0.005,
                             help='Floor for ent_coef (0=disable). Prevents entropy death spiral '
                                  'by clamping log_ent_coef >= log(ent_coef_min). (default: 0.005)')
+    stab_group.add_argument('--target-entropy', type=float, default=None,
+                            help='Target entropy for SAC auto-tuner. Default: -chunk_size '
+                                 '(RLPD heuristic). For tanh-squashed chunked actions, the '
+                                 'actual entropy at std~0.6 is ~+10 nats, so -chunk_size '
+                                 'is unreachable and permanently pins ent_coef at the floor. '
+                                 'Try 0 or +5 for a reachable equilibrium.')
     stab_group.add_argument('--no-backup-entropy', action='store_true',
                             help='Remove entropy term from TD target (RLPD-style). '
                                  'Reduces entropy-driven Q instability at the cost of slightly '
@@ -2008,7 +2020,9 @@ Examples:
     print(f"  Learning rate: {args.lr}")
     print(f"  Gamma: {args.gamma} (effective: {args.gamma ** args.chunk_size:.6f})")
     print(f"  Tau: {args.tau}")
+    _te = args.target_entropy if args.target_entropy is not None else -float(args.chunk_size)
     print(f"  Entropy coef: {ent_coef}")
+    print(f"  Target entropy: {_te} ({'--target-entropy' if args.target_entropy is not None else f'-chunk_size={args.chunk_size}'})")
     print(f"  Demo ratio: {args.demo_ratio}")
     print(f"  Learning starts: {args.learning_starts}")
     print(f"  CVAE: z_dim={args.cvae_z_dim}, epochs={args.cvae_epochs}, "
@@ -2398,7 +2412,7 @@ Examples:
             batch_size=args.batch_size,
             gamma=effective_gamma,
             ent_coef=ent_coef,
-            target_entropy=-float(args.chunk_size),  # -k: one nat per sub-action chunk step
+            target_entropy=args.target_entropy if args.target_entropy is not None else -float(args.chunk_size),
             gradient_steps=args.utd_ratio,
             learning_starts=args.learning_starts,
             train_freq=1,

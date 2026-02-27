@@ -394,7 +394,7 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
 2. Load demo transitions; **recompute demo rewards** with current `RewardComputer` to ensure consistency between demo and online data (avoids stale reward shaping from old reward function)
 3. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
-4. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-k (one nat per chunk step; matches RLPD's `-dim(A)/2` heuristic for correlated chunked actions; avoids entropy collapse with tanh squashing)
+4. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=`--target-entropy` (default: -chunk_size; override with 0 or +5 for tanh-squashed chunked actions where actual entropy is ~+10 nats)
 5. Inject LayerNorm into critics (`inject_layernorm_into_critics()`) — skipped for CrossQ (BatchRenorm built-in)
 6. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
 7. **Reset `log_std` and `ent_coef` after CVAE** (critical — see entropy pitfall below): CVAE sets `log_std.bias=-2.0` (std=0.135) and `ent_coef_init=0.006`. The new stability system (`--mean-clamp`, `--log-std-min`, `--ent-coef-min`) prevents entropy collapse without requiring log_std inflation. Pass `--log-std-init -0.5` for the old behavior of boosting exploration noise.
@@ -404,7 +404,7 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 ### Key Functions & Classes (`src/train_sac.py`)
 - **symlog()**: DreamerV3 symmetric log compression
 - **_set_bn_mode()**: Toggle BatchRenorm training mode if supported (CrossQ only; no-op for TQC/SAC)
-- **_create_timed_cls()**: Wraps any SB3 algo class with a `train()` override that measures total gradient step wall time; applied unconditionally before `--safe`/`--dual-policy` wrapping; SafeTQC/DualPolicy override `train()` and keep their own detailed timing
+- **_create_timed_cls()**: Wraps any SB3 algo class with a `train()` override that measures total gradient step wall time and enforces the `--ent-coef-min` floor for plain CrossQ/SAC (SafeTQC/DualPolicy have their own floor in their `train()` overrides); applied unconditionally before `--safe`/`--dual-policy` wrapping
 - **_patch_actor_for_stability()**: Monkey-patches `actor.get_action_dist_params()` to clamp pre-tanh means (`--mean-clamp`), floor log_std (`--log-std-min`), and store `_last_mean_actions` for diagnostics/regularization. Guards against double-patching via `_stability_patched` flag.
 - **ChunkCVAEFeatureExtractor.get_class()**: Returns SB3 BaseFeaturesExtractor with split state/lidar MLPs + z-pad
 - **TemporalCVAEFeatureExtractor.get_class()**: Returns GRU-based SB3 feature extractor for frame-stacked observations
@@ -439,7 +439,8 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 | `--mean-clamp` | 3.0 | Clamp \|pre-tanh mean\| (0=disable). Prevents tanh saturation (tanh(3)=0.995). |
 | `--mean-reg` | 0.001 | L2 reg weight on pre-tanh means (0=disable). Penalizes large means. |
 | `--log-std-min` | -5.0 | Minimum log_std floor (SB3 default: -20). exp(-5)=0.007 prevents near-zero std. |
-| `--ent-coef-min` | 0.005 | Floor for ent_coef (0=disable). Prevents entropy death spiral. |
+| `--ent-coef-min` | 0.005 | Floor for ent_coef (0=disable). Prevents entropy death spiral. Applied to both plain CrossQ and SafeTQC/DualPolicy. |
+| `--target-entropy` | None (-chunk_size) | Target entropy for SAC auto-tuner. Default -chunk_size is unreachable for tanh-squashed chunked actions (actual H~+10 nats); use 0 or +5 for reachable equilibrium. |
 | `--no-backup-entropy` | off | Remove entropy from TD target (RLPD-style). Reduces entropy-driven Q instability. |
 | `--safe` | off | Enable SafeTQC (cost critic + Lagrange) |
 | `--cost-limit` | 25.0 | Per-episode cost budget |
@@ -558,13 +559,15 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 | Near-miss episodes (gd<0.5m) still negative returns | Approach bonus too weak or radius too small | Check `APPROACH_BONUS_SCALE` and `APPROACH_BONUS_RADIUS`; near-misses at gd=0.25m should get ~+7.5 approach bonus |
 | Proximity penalty > collision penalty | `PROXIMITY_SCALE` too high or `COLLISION_PENALTY` too low | Per-episode proximity should stay below collision magnitude; check hierarchy: collision >> proximity >> time |
 | `\|mu\|` > 2.0 in `[DEBUG]` lines | Pre-tanh mean explosion / tanh saturation | `--mean-clamp 3.0` (default) prevents runaway; `--mean-reg 0.001` adds L2 penalty; check `train/mean_mu_abs` in TensorBoard |
-| `ent_coef` pinned at floor (0.005) | Entropy wants to collapse further | Policy may be too deterministic; consider increasing `--ent-coef-min` or checking if CVAE overfitted |
+| `ent_coef` pinned at floor (0.005) | target_entropy unreachable OR policy too deterministic | If `ent_coef_loss` is strongly negative, raise `--target-entropy` (e.g., 0 or +5). If `ent_coef_loss` oscillates near 0, the floor is correct and the policy is near equilibrium. |
 
 ## Known Pitfalls & Fixes
 
 ### target_entropy for Chunked Actions
-- **Wrong:** `target_entropy="auto"` → SB3 computes `-dim(A)` = `-chunk_size*2` (e.g., -10 for chunk_size=5). This is too aggressive for correlated chunked actions and causes entropy death spiral.
-- **Correct:** `target_entropy=-chunk_size` (e.g., -5 for chunk_size=5). Matches RLPD's `-dim(A)/2` heuristic. One nat per temporal step in the chunk.
+- **Wrong:** `target_entropy="auto"` -> SB3 computes `-dim(A)` = `-chunk_size*2` (e.g., -20 for chunk_size=10). This is too aggressive for correlated chunked actions and causes entropy death spiral.
+- **Better:** `target_entropy=-chunk_size` (e.g., -10 for chunk_size=10). Matches RLPD's `-dim(A)/2` heuristic.
+- **Problem:** For tanh-squashed 20D actions with std~0.6, actual entropy is ~+10 nats (pre-tanh Gaussian ~+18 nats, tanh correction ~-7 nats). A target of -10 is 20 nats below actual entropy, permanently pinning ent_coef at the floor. The policy effectively trains with zero entropy regularization.
+- **Recommended:** Use `--target-entropy 0` (conservative) or `--target-entropy 5` (moderate exploration). This gives the auto-tuner a reachable equilibrium where it can increase or decrease ent_coef based on policy behavior.
 
 ### Demo Observation v1→v2 Conversion and Arena Size
 - Old demos (OBS_VERSION=1) are auto-converted to ego-centric layout (v2) on load

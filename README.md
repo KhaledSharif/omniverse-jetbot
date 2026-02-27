@@ -239,7 +239,7 @@ ChunkCVAEFeatureExtractor (dynamic split: state_dim = obs_dim - 24):
 **Pipeline order:**
 1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
 2. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
-3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-2.0
+3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=`--target-entropy` (default: -chunk_size)
 4. Inject LayerNorm into critics (skipped for CrossQ — BatchRenorm built-in)
 5. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
 6. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
@@ -257,8 +257,10 @@ ChunkCVAEFeatureExtractor (dynamic split: state_dim = obs_dim - 24):
 | `--cvae-beta` | 0.1 | CVAE KL weight |
 | `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
 | `--demo-ratio` | 0.5 | Fraction of batch from demos |
-| `--log-std-init` | -0.5 | Actor log_std after CVAE pretraining or on `--resume`. CVAE sets -2.0 (std=0.135) collapsing entropy before SAC starts; checkpoints may retain this. -0.5 (std=0.61) gives SAC room to explore. Applied on both fresh start and `--resume`; pass -2.0 to keep CVAE/checkpoint value. |
-| `--ent-coef-init` | 0.1 | ent_coef set after CVAE pretraining and on `--resume`. CVAE/checkpoint may leave ent_coef ≈0.006 (entropy bonus negligible vs Q-values). Use 0 to disable. |
+| `--log-std-init` | -2.0 | Actor log_std after CVAE pretraining or on `--resume`. -2.0 keeps CVAE/checkpoint value (stability system handles entropy). Pass -0.5 for old behavior of boosting exploration noise. |
+| `--ent-coef-init` | 0.1 | ent_coef set after CVAE pretraining and on `--resume`. CVAE/checkpoint may leave ent_coef near 0 (entropy bonus negligible vs Q-values). Use 0 to disable. |
+| `--target-entropy` | None (-chunk_size) | Target entropy for SAC auto-tuner. Default -chunk_size is unreachable for tanh-squashed chunked actions; use 0 or +5. |
+| `--ent-coef-min` | 0.005 | Floor for ent_coef to prevent entropy death spiral. |
 
 #### SafeTQC: Constrained RL with Lagrange Multiplier
 
