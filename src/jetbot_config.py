@@ -28,6 +28,13 @@ DEFAULT_WORKSPACE_BOUNDS = {
 }
 
 
+# Camera constants (DINOv2 vision pipeline)
+CAMERA_PRIM_SUFFIX = "/chassis/rgb_camera/jetbot_camera"
+CAMERA_WIDTH = 84
+CAMERA_HEIGHT = 84
+IMAGE_FEATURE_DIM = 384  # DINOv2 ViT-S/14 CLS token
+
+
 def quaternion_to_yaw(orientation) -> float:
     """Convert Isaac Sim quaternion (w, x, y, z) to yaw angle in radians.
 

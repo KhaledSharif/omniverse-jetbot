@@ -225,6 +225,87 @@ class TemporalCVAEFeatureExtractor:
         return cls._cls
 
 
+class VisionCVAEFeatureExtractor:
+    """SB3 feature extractor for camera observations with three-way split.
+
+    Splits obs into state (0:state_dim), image features (state_dim:-24),
+    and LiDAR (-24:). State and LiDAR use symlog; DINOv2 features are raw.
+
+    Output: concat(state_32D, image_64D, lidar_64D, z_pad) = 160 + z_dim = 168D
+    """
+
+    _cls = None
+
+    @staticmethod
+    def create(base_extractor_cls, z_dim=8):
+        import torch
+        import torch.nn as nn
+
+        class _VisionCVAEFeatureExtractor(base_extractor_cls):
+            def __init__(self, observation_space, features_dim=168):
+                super().__init__(observation_space, features_dim=features_dim)
+                self._z_dim = z_dim
+                self._obs_feature_dim = features_dim - z_dim  # 160
+
+                obs_dim = observation_space.shape[0]
+                self._lidar_dim = 24
+                # image_dim = IMAGE_FEATURE_DIM (384)
+                # state_dim = obs_dim - 384 - 24 = 10 or 12
+                from jetbot_config import IMAGE_FEATURE_DIM
+                self._image_dim = IMAGE_FEATURE_DIM
+                self._state_dim = obs_dim - self._image_dim - self._lidar_dim
+
+                self.state_mlp = nn.Sequential(
+                    nn.Linear(self._state_dim, 64),
+                    nn.SiLU(),
+                    nn.Linear(64, 32),
+                    nn.SiLU(),
+                )
+
+                self.image_mlp = nn.Sequential(
+                    nn.Linear(self._image_dim, 256),
+                    nn.SiLU(),
+                    nn.Linear(256, 64),
+                    nn.SiLU(),
+                )
+
+                self.lidar_mlp = nn.Sequential(
+                    nn.Linear(self._lidar_dim, 128),
+                    nn.SiLU(),
+                    nn.Linear(128, 64),
+                    nn.SiLU(),
+                )
+
+            def encode_obs(self, observations):
+                """Encode observations into obs_features (without z padding).
+
+                Returns:
+                    obs_features tensor of shape (batch, 160)
+                """
+                state = symlog(observations[:, :self._state_dim])
+                image = observations[:, self._state_dim:self._state_dim + self._image_dim]
+                lidar = symlog(observations[:, -self._lidar_dim:])
+                state_features = self.state_mlp(state)    # 32D
+                image_features = self.image_mlp(image)    # 64D
+                lidar_features = self.lidar_mlp(lidar)    # 64D
+                return torch.cat([state_features, image_features, lidar_features], dim=-1)
+
+            def forward(self, observations):
+                obs_features = self.encode_obs(observations)
+                z_pad = torch.zeros(
+                    obs_features.shape[0], self._z_dim,
+                    device=obs_features.device, dtype=obs_features.dtype,
+                )
+                return torch.cat([obs_features, z_pad], dim=-1)
+
+        return _VisionCVAEFeatureExtractor
+
+    @classmethod
+    def get_class(cls, base_extractor_cls, z_dim=8):
+        cls._cls = cls.create(base_extractor_cls, z_dim=z_dim)
+        return cls._cls
+
+
 def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
                         chunk_size, z_dim=8, epochs=100, batch_size=256,
                         lr=1e-3, beta=0.1, gamma=0.99, gru_lr=None):
@@ -1323,7 +1404,7 @@ def _create_safe_tqc_class(tqc_base_cls):
             return state_dicts, saved_vars
 
         def _excluded_save_params(self):
-            excluded = super()._excluded_save_params()
+            excluded = set(super()._excluded_save_params())
             excluded.add("cost_buffer")
             return excluded
 
@@ -1948,6 +2029,8 @@ Examples:
                         help='Obstacle inflation radius for A* planner in meters (default: 0.08)')
     parser.add_argument('--add-prev-action', action='store_true',
                         help='Add previous action to observations (34D -> 36D)')
+    parser.add_argument('--use-camera', action='store_true',
+                        help='Enable DINOv2 camera features in observations (34D -> 418D)')
 
     # Checkpoint arguments
     parser.add_argument('--checkpoint-freq', type=int, default=50000,
@@ -2029,6 +2112,8 @@ Examples:
           f"beta={args.cvae_beta}, lr={args.cvae_lr}")
     if args.n_frames > 1:
         print(f"  Frame stacking: n_frames={args.n_frames}, gru_hidden={args.gru_hidden}, gru_lr={args.gru_lr}")
+    if args.use_camera:
+        print(f"  Camera: DINOv2 ViT-S/14 (384D features)")
     print(f"  Reward mode: {args.reward_mode}")
     print(f"  Headless: {args.headless}")
     print(f"  Seed: {args.seed}")
@@ -2144,6 +2229,7 @@ Examples:
         cost_type=getattr(args, 'cost_type', 'proximity'),
         safe_mode=safe_mode,
         add_prev_action=getattr(args, 'add_prev_action', False),
+        use_camera=getattr(args, 'use_camera', False),
     )
     if args.n_frames > 1:
         base_obs_dim = raw_env.observation_space.shape[0]
@@ -2161,12 +2247,13 @@ Examples:
     # Load step-level demo transitions (for CVAE pretraining)
     print("Loading demo transitions...")
     demo_costs_step = None
+    _load_images = getattr(args, 'use_camera', False)
     if args.safe:
         demo_obs_step, demo_actions_step, demo_rewards_step, _, demo_dones_step, demo_costs_step = \
-            load_demo_transitions(args.demos, load_costs=True)
+            load_demo_transitions(args.demos, load_costs=True, load_images=_load_images)
     else:
         demo_obs_step, demo_actions_step, demo_rewards_step, _, demo_dones_step = \
-            load_demo_transitions(args.demos)
+            load_demo_transitions(args.demos, load_images=_load_images)
     from demo_io import open_demo
     demo_data = open_demo(args.demos)
     episode_lengths = demo_data['episode_lengths']
@@ -2262,6 +2349,8 @@ Examples:
     # Feature extractor dimensions
     if args.n_frames > 1:
         obs_feature_dim = args.gru_hidden
+    elif getattr(args, 'use_camera', False):
+        obs_feature_dim = 160  # 32 + 64 + 64 (state + image + lidar)
     else:
         obs_feature_dim = 96
     features_dim = obs_feature_dim + args.cvae_z_dim
@@ -2389,6 +2478,9 @@ Examples:
             fe_cls = TemporalCVAEFeatureExtractor.get_class(
                 BaseFeaturesExtractor, n_frames=args.n_frames,
                 gru_hidden_dim=args.gru_hidden, z_dim=args.cvae_z_dim)
+        elif getattr(args, 'use_camera', False):
+            fe_cls = VisionCVAEFeatureExtractor.get_class(
+                BaseFeaturesExtractor, z_dim=args.cvae_z_dim)
         else:
             fe_cls = ChunkCVAEFeatureExtractor.get_class(
                 BaseFeaturesExtractor, z_dim=args.cvae_z_dim)

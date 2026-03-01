@@ -54,9 +54,9 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - `replay.py` - Demo playback and inspection
 
 6. **Shared Modules**
-   - `jetbot_config.py` - Single source of truth for robot physical constants (`WHEEL_RADIUS`, `WHEEL_BASE`, velocity limits, start pose, workspace bounds), `quaternion_to_yaw()` utility, and `OBS_VERSION` constant
-   - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, `extract_action_chunks()`, `make_chunk_transitions()`, `build_frame_stacks()`, `convert_obs_to_egocentric()`, and `VerboseEpisodeCallback` (enhanced training diagnostics)
-   - `demo_io.py` - Unified demo I/O adapter: `open_demo()` dispatches `.npz`/`.hdf5`, `HDF5DemoWriter` for O(delta) incremental recording, `convert_npz_to_hdf5()` migration utility
+   - `jetbot_config.py` - Single source of truth for robot physical constants (`WHEEL_RADIUS`, `WHEEL_BASE`, velocity limits, start pose, workspace bounds), `quaternion_to_yaw()` utility, `OBS_VERSION` constant, and camera constants (`CAMERA_PRIM_SUFFIX`, `CAMERA_WIDTH`, `CAMERA_HEIGHT`, `IMAGE_FEATURE_DIM`)
+   - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, `extract_action_chunks()`, `make_chunk_transitions()`, `build_frame_stacks()`, `convert_obs_to_egocentric()`, `VerboseEpisodeCallback` (enhanced training diagnostics), and DINOv2 utilities (`encode_images_dinov2()`, `build_camera_obs()`, `load_demo_images()`)
+   - `demo_io.py` - Unified demo I/O adapter: `open_demo()` dispatches `.npz`/`.hdf5`, `HDF5DemoWriter` for O(delta) incremental recording (with optional `/images` dataset for camera demos), `convert_npz_to_hdf5()` migration utility
 
 ### Key Classes
 
@@ -69,6 +69,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **FrameStackWrapper**: Stacks last n_frames observations into (n_frames * obs_dim,), oldest first (`src/jetbot_rl_env.py`)
 - **ChunkedEnvWrapper**: Converts single-step env to k-step chunked env for Q-chunking (`src/jetbot_rl_env.py`); info dict includes `goal_distance`, `min_lidar_distance`, `collision`, `is_success`, `cost`
 - **ChunkCVAEFeatureExtractor**: Dynamic split: state MLP (state_dim->32D) + LiDAR MLP (24->64D) + z-pad (8D) = 104D. Split is `obs[:obs_dim-24]` / `obs[obs_dim-24:]` for 34D/36D
+- **VisionCVAEFeatureExtractor**: Three-way split for `--use-camera`: state MLP (state_dim->32D) + image MLP (384->64D, no symlog) + LiDAR MLP (24->64D) + z-pad (8D) = 168D (`src/train_sac.py`)
 - **TemporalCVAEFeatureExtractor**: GRU-based feature extractor for frame-stacked obs (`src/train_sac.py`)
 - **SafeTQC**: CrossQ/TQC subclass with dual cost critic + Lagrange multiplier (`src/train_sac.py`)
 - **CostReplayBuffer**: Parallel ring buffer storing per-transition costs (`src/train_sac.py`)
@@ -116,10 +117,18 @@ System:
 
 With `--add-prev-action` (36D): inserts `[prev_linear_vel, prev_angular_vel]` at indices [10:12], pushing LiDAR to [12:36].
 
-The RL environment (`JetbotNavigationEnv`) always uses 34D observations with LiDAR (36D with `--add-prev-action`).
+With `--use-camera` (418D/420D): inserts 384D DINOv2 ViT-S/14 CLS features between state and LiDAR:
+```
+Without camera: [state(10D), lidar(24D)] = 34D
+With camera:    [state(10D), image_features(384D), lidar(24D)] = 418D
+With camera+prev_action: [state(10D), prev_action(2D), image_features(384D), lidar(24D)] = 420D
+```
+LiDAR always occupies the last 24 dimensions. DINOv2 features are extracted inside `env.step()` from an 84x84 RGB camera. Raw images are stored in HDF5 demos; DINOv2 encoding happens at training load time via `encode_images_dinov2()`.
+
+The RL environment (`JetbotNavigationEnv`) always uses 34D observations with LiDAR (36D with `--add-prev-action`, 418D/420D with `--use-camera`).
 The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 
-**Feature extractor split**: `state = obs[:obs_dim-24]`, `lidar = obs[obs_dim-24:]` — dynamic split supports both 34D and 36D observations.
+**Feature extractor split**: `state = obs[:obs_dim-24]`, `lidar = obs[obs_dim-24:]` — dynamic split supports both 34D and 36D observations. With `--use-camera`, `VisionCVAEFeatureExtractor` uses a three-way split: `state = obs[:state_dim]`, `image = obs[state_dim:-24]`, `lidar = obs[-24:]`.
 
 ### Action Space (2D)
 ```
@@ -155,7 +164,13 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 # SafeTQC: constrained RL with cost critic + Lagrange multiplier
 ./run.sh train_sac.py --demos demos/recording.npz --headless --safe
 
-# Evaluation (auto-detects algorithm and chunk size)
+# DINOv2 camera training (requires camera demos)
+./run.sh train_sac.py --demos demos/camera_demo.hdf5 --headless --use-camera
+
+# Record camera demos
+./run.sh --enable-recording --automatic --use-camera --num-episodes 50
+
+# Evaluation (auto-detects algorithm, chunk size, and camera from obs dim)
 ./run.sh eval_policy.py models/crossq_jetbot.zip --episodes 100
 
 # Tests
@@ -257,6 +272,8 @@ In headless mode, `jetbot_rl_env.py` applies several optimizations:
 
 These collectively save a few ms per step but are minor compared to UTD ratio.
 
+**Camera mode exception**: When `--use-camera` is active, headless optimizations that disable rendering are skipped (`enable_cameras=True`, no `rendering_dt=1.0`, no `disable_viewport_updates`). The camera requires active rendering even in headless mode, reducing throughput to ~10-20 steps/s.
+
 ## Chunk CVAE + Q-Chunking
 
 The CrossQ/TQC pipeline uses action chunking to reduce compounding errors from single-step BC. The actor predicts k-step action chunks, a CVAE handles multimodal demonstrations, and a `ChunkedEnvWrapper` enables chunk-level Q-values (Q-chunking).
@@ -273,6 +290,12 @@ ChunkCVAEFeatureExtractor (dynamic split: state_dim = obs_dim - 24):
   obs → split → [state 0:state_dim]       → symlog → MLP(state_dim→64→32) → 32D ┐
                  [lidar state_dim:obs_dim] → symlog → MLP(24→128→64)       → 64D ├→ concat → 96D + z_pad(8D) = 104D
                                                                                    └→ z_pad = zeros(z_dim)
+
+VisionCVAEFeatureExtractor (when --use-camera):
+  obs → split → [state 0:state_dim]                → symlog → MLP(state_dim→64→32) → 32D ┐
+                 [image state_dim:state_dim+384]    →          MLP(384→256→64)      → 64D ├→ concat → 160D + z_pad(8D) = 168D
+                 [lidar obs_dim-24:]                → symlog → MLP(24→128→64)       → 64D ┘
+  Note: No symlog on DINOv2 features (already normalized by ImageNet stats)
 
 TemporalCVAEFeatureExtractor (when --n-frames > 1):
   Wrapping order: ChunkedEnvWrapper( FrameStackWrapper( JetbotNavigationEnv ) )
@@ -328,6 +351,7 @@ KL collapse (`active_dims=0`) is **expected** for deterministic demos (A* autopi
 | `--ent-coef-min` | 0.005 | ent_coef floor (0=disable) |
 | `--target-entropy` | -chunk_size | SAC target entropy; use 0 or +5 for reachable equilibrium |
 | `--no-backup-entropy` | off | Remove entropy from TD target |
+| `--use-camera` | off | DINOv2 camera features (418D obs) |
 | `--safe` | off | SafeTQC (cost critic + Lagrange) |
 | `--cost-limit` | 25.0 | Per-episode cost budget |
 | `--lagrange-lr` | 3e-4 | Lagrange multiplier LR |
@@ -343,8 +367,9 @@ Same as above but: env uses `safe_mode=True` (removes proximity penalty); load d
 
 ### Compatibility
 - `--resume`: SB3 pickles `features_extractor_class`; chunk_size auto-detected from action_dim
-- `eval_policy.py`: Auto-detects CrossQ/TQC/SAC/PPO, chunk_size, and n_frames from model spaces
+- `eval_policy.py`: Auto-detects CrossQ/TQC/SAC/PPO, chunk_size, n_frames, and camera from model obs dimension (`obs_dim - 384` in `{34, 36}` implies camera)
 - **Demo format**: Old demos (pre-OBS_VERSION=2) auto-converted to ego-centric via `convert_obs_to_egocentric()` in `demo_utils.py`; reads `arena_size` from demo metadata
+- **Camera demos**: HDF5 demos with `/images` dataset (84x84x3 uint8, gzip); old demos without images work normally (`load_images=False` by default)
 
 ## Training Diagnostics
 

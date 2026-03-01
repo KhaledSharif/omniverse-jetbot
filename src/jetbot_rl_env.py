@@ -45,6 +45,7 @@ from jetbot_config import (
     MAX_LINEAR_VELOCITY, MAX_ANGULAR_VELOCITY,
     START_POSITION, START_ORIENTATION,
     DEFAULT_WORKSPACE_BOUNDS,
+    CAMERA_PRIM_SUFFIX, CAMERA_WIDTH, CAMERA_HEIGHT, IMAGE_FEATURE_DIM,
     quaternion_to_yaw,
 )
 
@@ -115,6 +116,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         cost_type: str = 'proximity',
         safe_mode: bool = False,
         add_prev_action: bool = False,
+        use_camera: bool = False,
     ):
         """Initialize the Jetbot navigation environment.
 
@@ -128,6 +130,7 @@ class JetbotNavigationEnv(gymnasium.Env):
             num_obstacles: Number of obstacles to spawn (default: 5)
             min_goal_dist: Minimum distance from robot start to goal (meters)
             inflation_radius: Obstacle inflation radius for A* solvability checks (meters)
+            use_camera: If True, add 384D DINOv2 features to observations
         """
         super().__init__()
 
@@ -144,6 +147,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.cost_type = cost_type
         self.safe_mode = safe_mode
         self.add_prev_action = add_prev_action
+        self.use_camera = use_camera
 
         # Create LiDAR sensor
         self.lidar_sensor = LidarSensor(
@@ -152,8 +156,12 @@ class JetbotNavigationEnv(gymnasium.Env):
             max_range=self.LIDAR_MAX_RANGE
         )
 
-        # Define observation and action spaces (10 base + optional 2 prev_action + 24 LiDAR)
-        obs_dim = 10 + (2 if self.add_prev_action else 0) + self.NUM_LIDAR_RAYS
+        # Define observation and action spaces
+        # 10 base + optional 2 prev_action + optional 384 image features + 24 LiDAR
+        obs_dim = (10
+                   + (2 if self.add_prev_action else 0)
+                   + (IMAGE_FEATURE_DIM if self.use_camera else 0)
+                   + self.NUM_LIDAR_RAYS)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -192,6 +200,10 @@ class JetbotNavigationEnv(gymnasium.Env):
         self._current_angular_vel = 0.0
         self._prev_action = np.zeros(2, dtype=np.float32)
 
+        # Camera state
+        self._last_camera_frame = None
+        self._camera_features = None
+
         # Timing accumulators for physics step profiling
         self._wstep_ms_acc = 0.0
         self._wstep_n = 0
@@ -204,10 +216,14 @@ class JetbotNavigationEnv(gymnasium.Env):
         # Create SimulationApp if not already created
         if simulation_app is None:
             config = {"headless": self.headless}
-            if self.headless:
+            if self.headless and not self.use_camera:
                 config["disable_viewport_updates"] = True
                 config["anti_aliasing"] = 0
                 config["samples_per_pixel_per_frame"] = 1
+            elif self.headless and self.use_camera:
+                # Camera needs rendering even in headless; enable_cameras is required
+                config["enable_cameras"] = True
+                config["anti_aliasing"] = 0
             simulation_app = SimulationApp(config)
 
             # Disable rendering subsystems in headless mode
@@ -233,7 +249,7 @@ class JetbotNavigationEnv(gymnasium.Env):
             get_assets_root_path = _get_assets_root_path
 
         # Create world — decouple rendering from physics in headless mode
-        if self.headless:
+        if self.headless and not self.use_camera:
             self.world = World(
                 stage_units_in_meters=1.0,
                 physics_dt=1.0 / 60.0,
@@ -272,8 +288,13 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.world.reset()
 
         # Optimize physics scene for RL training (single robot, flat ground)
-        if self.headless:
+        if self.headless and not self.use_camera:
             self._optimize_physics_scene()
+
+        # Initialize camera + DINOv2 if enabled
+        if self.use_camera:
+            self._init_camera()
+            self._init_dinov2()
 
     def _optimize_physics_scene(self):
         """Tune PhysX scene for single-robot RL: CPU broadphase, fewer solver iters."""
@@ -296,6 +317,83 @@ class JetbotNavigationEnv(gymnasium.Env):
                     break
         except Exception as e:
             print(f"  Warning: Could not optimize physics scene: {e}")
+
+    def _init_camera(self):
+        """Initialize the Isaac Sim camera sensor on the Jetbot's camera prim."""
+        from isaacsim.sensors.camera import Camera
+
+        camera_prim_path = "/World/Jetbot" + CAMERA_PRIM_SUFFIX
+        self._camera = Camera(
+            prim_path=camera_prim_path,
+            resolution=(CAMERA_WIDTH, CAMERA_HEIGHT),
+            name="jetbot_rl_camera",
+        )
+        self._camera.initialize()
+        # Warm-up: render a few frames so camera has valid output
+        for _ in range(5):
+            self.world.step(render=True)
+        self._last_camera_frame = None
+        print(f"  Camera initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT} on {camera_prim_path}")
+
+    def _init_dinov2(self):
+        """Load frozen DINOv2 ViT-S/14 and pre-compute normalization tensors."""
+        import torch
+
+        self._dinov2_device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self._dinov2_model = torch.hub.load(
+            'facebookresearch/dinov2', 'dinov2_vits14',
+        )
+        self._dinov2_model = self._dinov2_model.to(self._dinov2_device)
+        self._dinov2_model.eval()
+        for p in self._dinov2_model.parameters():
+            p.requires_grad = False
+
+        # ImageNet normalization tensors (C, 1, 1) for broadcasting
+        self._dinov2_mean = torch.tensor(
+            [0.485, 0.456, 0.406], device=self._dinov2_device
+        ).view(3, 1, 1)
+        self._dinov2_std = torch.tensor(
+            [0.229, 0.224, 0.225], device=self._dinov2_device
+        ).view(3, 1, 1)
+        print(f"  DINOv2 ViT-S/14 loaded on {self._dinov2_device} "
+              f"(output: {IMAGE_FEATURE_DIM}D)")
+
+    def _capture_camera_features(self):
+        """Capture camera frame, run through DINOv2, return features + raw frame.
+
+        Returns:
+            Tuple of (features_384D_np, raw_rgb_uint8)
+        """
+        import torch
+
+        # Get RGBA from camera, convert to RGB uint8
+        rgba = self._camera.get_rgba()
+        if rgba is None or rgba.size == 0:
+            # Fallback: return zeros if camera not ready
+            self._last_camera_frame = np.zeros(
+                (CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+            return np.zeros(IMAGE_FEATURE_DIM, dtype=np.float32), self._last_camera_frame
+        rgb = rgba[:, :, :3].astype(np.uint8)
+        self._last_camera_frame = rgb.copy()
+
+        # Convert to tensor: (H, W, 3) uint8 -> (1, 3, H, W) float32 [0, 1]
+        img_tensor = torch.from_numpy(rgb).float().permute(2, 0, 1).unsqueeze(0)
+        img_tensor = img_tensor.to(self._dinov2_device) / 255.0
+        # ImageNet normalization
+        img_tensor = (img_tensor - self._dinov2_mean) / self._dinov2_std
+
+        # DINOv2 forward: CLS token -> (1, 384)
+        with torch.no_grad():
+            features = self._dinov2_model(img_tensor)  # (1, 384)
+        features_np = features.squeeze(0).cpu().numpy().astype(np.float32)
+        return features_np, self._last_camera_frame
+
+    @property
+    def last_camera_frame(self):
+        """Last raw RGB uint8 frame captured by the camera (for demo recording)."""
+        return self._last_camera_frame
 
     def _get_robot_pose(self) -> tuple:
         """Get current robot position and heading.
@@ -354,9 +452,11 @@ class JetbotNavigationEnv(gymnasium.Env):
         else:
             print(f"Warning: no solvable layout found after {max_solvability_attempts} attempts, using last layout")
 
-        # Step simulation to settle physics
-        for _ in range(2):
-            self.world.step(render=not self.headless)
+        # Step simulation to settle physics (render required for camera)
+        _render = not self.headless or self.use_camera
+        _settle_steps = 5 if self.use_camera else 2
+        for _ in range(_settle_steps):
+            self.world.step(render=_render)
 
         # Reset tracking state
         self._step_count = 0
@@ -405,9 +505,10 @@ class JetbotNavigationEnv(gymnasium.Env):
         )
         self.jetbot.apply_wheel_actions(wheel_actions)
 
-        # Step simulation
+        # Step simulation (render required for camera even in headless mode)
+        _render = not self.headless or self.use_camera
         _wt0 = time.perf_counter()
-        self.world.step(render=not self.headless)
+        self.world.step(render=_render)
         self._wstep_ms_acc += (time.perf_counter() - _wt0) * 1000
         self._wstep_n += 1
         if self._wstep_n % 1000 == 0:
@@ -428,9 +529,8 @@ class JetbotNavigationEnv(gymnasium.Env):
         position, _ = self._get_robot_pose()
         goal_reached = self.scene_manager.check_goal_reached(position, threshold=self.goal_threshold)
 
-        # Extract min LiDAR distance from the LiDAR portion of the observation
-        lidar_start = 12 if self.add_prev_action else 10
-        lidar_readings = next_obs[lidar_start:]  # Normalized LiDAR values
+        # Extract min LiDAR distance from the last 24D of the observation
+        lidar_readings = next_obs[-self.NUM_LIDAR_RAYS:]  # Normalized LiDAR values
         min_lidar = float(lidar_readings.min()) * self.lidar_sensor.max_range
         collision = min_lidar < self.COLLISION_THRESHOLD
 
@@ -464,7 +564,8 @@ class JetbotNavigationEnv(gymnasium.Env):
         """Build observation vector from current state.
 
         Returns:
-            34D (or 36D with add_prev_action) observation vector as float32 numpy array
+            34D/36D (no camera) or 418D/420D (with camera) observation as float32 numpy array.
+            Layout: [state, (prev_action), (image_features_384D), lidar_24D]
         """
         # Get robot state
         position, heading = self._get_robot_pose()
@@ -488,13 +589,24 @@ class JetbotNavigationEnv(gymnasium.Env):
             workspace_bounds=self.workspace_bounds
         )
 
-        # Insert prev_action after base obs (before LiDAR)
-        if self.add_prev_action:
-            base = obs[:10]
-            lidar = obs[10:]
-            obs = np.concatenate([base, self._prev_action, lidar])
+        # Split into base state and LiDAR
+        base = obs[:10]
+        lidar = obs[10:]
 
-        return obs
+        parts = [base]
+
+        # Insert prev_action after base obs
+        if self.add_prev_action:
+            parts.append(self._prev_action)
+
+        # Insert camera features before LiDAR
+        if self.use_camera:
+            features, _ = self._capture_camera_features()
+            self._camera_features = features
+            parts.append(features)
+
+        parts.append(lidar)
+        return np.concatenate(parts).astype(np.float32)
 
     def _check_termination(self, info, position):
         """Check if episode should terminate (success or failure).

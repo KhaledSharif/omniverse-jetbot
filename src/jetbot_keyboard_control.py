@@ -705,7 +705,8 @@ class DemoRecorder:
         is_recording: Whether recording is active
     """
 
-    def __init__(self, obs_dim: int, action_dim: int, hdf5_path: str = None):
+    def __init__(self, obs_dim: int, action_dim: int, hdf5_path: str = None,
+                 image_shape: tuple = None):
         """Initialize the DemoRecorder.
 
         Args:
@@ -714,9 +715,12 @@ class DemoRecorder:
             hdf5_path: Optional path to HDF5 file for incremental writing.
                 When provided, checkpoint saves use O(delta) HDF5 appends
                 instead of O(N) NPZ rewrites.
+            image_shape: Optional (H, W, C) for camera image recording.
+                When set, creates /images dataset in HDF5.
         """
         self.obs_dim = obs_dim
         self.action_dim = action_dim
+        self._image_shape = image_shape
 
         # Data buffers
         self.observations = []
@@ -724,6 +728,7 @@ class DemoRecorder:
         self.rewards = []
         self.dones = []
         self.costs = []
+        self.images = []
 
         # Episode tracking
         self.episode_starts = []
@@ -741,7 +746,8 @@ class DemoRecorder:
         self._hdf5_writer = None
         if hdf5_path is not None:
             from demo_io import HDF5DemoWriter
-            self._hdf5_writer = HDF5DemoWriter(hdf5_path, obs_dim, action_dim)
+            self._hdf5_writer = HDF5DemoWriter(hdf5_path, obs_dim, action_dim,
+                                                image_shape=image_shape)
 
     def start_recording(self) -> None:
         """Start recording a new episode."""
@@ -755,7 +761,8 @@ class DemoRecorder:
         self.is_recording = False
 
     def record_step(self, obs: np.ndarray, action: np.ndarray,
-                    reward: float, done: bool, cost: float = 0.0) -> None:
+                    reward: float, done: bool, cost: float = 0.0,
+                    image: np.ndarray = None) -> None:
         """Record a single timestep.
 
         Args:
@@ -764,6 +771,7 @@ class DemoRecorder:
             reward: Reward value
             done: Whether episode is done
             cost: Constraint cost value (for SafeTQC)
+            image: Optional RGB camera frame (H, W, 3) uint8
         """
         if not self.is_recording:
             return
@@ -773,6 +781,8 @@ class DemoRecorder:
         self.rewards.append(reward)
         self.dones.append(done)
         self.costs.append(cost)
+        if image is not None:
+            self.images.append(image.copy())
         self.current_episode_return += reward
 
     def mark_episode_success(self, success: bool) -> None:
@@ -814,6 +824,7 @@ class DemoRecorder:
         self.rewards = self.rewards[:target]
         self.dones = self.dones[:target]
         self.costs = self.costs[:target]
+        self.images = self.images[:target]
         self.current_episode_return = 0.0
         self._pending_success = None
 
@@ -847,6 +858,7 @@ class DemoRecorder:
         self.rewards = []
         self.dones = []
         self.costs = []
+        self.images = []
         self.episode_starts = []
         self.episode_lengths = []
         self.episode_returns = []
@@ -897,6 +909,10 @@ class DemoRecorder:
         if self.costs:
             save_metadata['has_cost'] = True
 
+        # Add image metadata if images were recorded
+        if self.images:
+            save_metadata['has_images'] = True
+
         # ---- HDF5 incremental path ----
         if self._hdf5_writer is not None:
             writer = self._hdf5_writer
@@ -913,6 +929,11 @@ class DemoRecorder:
                     np.array(self.dones[step_cursor:], dtype=bool),
                     np.array(self.costs[step_cursor:], dtype=np.float32) if self.costs else np.zeros(n_new, dtype=np.float32),
                 )
+                # Append images if recording camera
+                if self.images and len(self.images) > step_cursor:
+                    writer.append_images(
+                        np.array(self.images[step_cursor:], dtype=np.uint8)
+                    )
 
             # Append new episodes since last flush
             for i in range(ep_cursor, len(self.episode_starts)):
@@ -1901,7 +1922,8 @@ class JetbotKeyboardController:
                  inflation_radius: float = 0.08,
                  noise_linear: float = 0.02,
                  noise_angular: float = 0.1,
-                 lookahead: float = 0.2):
+                 lookahead: float = 0.2,
+                 use_camera_recording: bool = False):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -2014,6 +2036,8 @@ class JetbotKeyboardController:
         self.num_obstacles = num_obstacles
         self.max_steps = max_steps
 
+        self.use_camera_recording = use_camera_recording
+
         # Force LiDAR in automatic mode (A* expert needs 34D observations)
         if automatic:
             self.use_lidar = True
@@ -2112,11 +2136,36 @@ class JetbotKeyboardController:
 
         # Initialize demo recorder with correct obs dimension
         hdf5_path = self.demo_save_path if self.demo_save_path.endswith(('.hdf5', '.h5')) else None
+        image_shape = None
+        if self.use_camera_recording:
+            from jetbot_config import CAMERA_HEIGHT, CAMERA_WIDTH
+            image_shape = (CAMERA_HEIGHT, CAMERA_WIDTH, 3)
         self.recorder = DemoRecorder(obs_dim=self.obs_builder.obs_dim, action_dim=2,
-                                     hdf5_path=hdf5_path)
+                                     hdf5_path=hdf5_path, image_shape=image_shape)
 
         # Initialize reward computer
         self.reward_computer = RewardComputer(mode=self.reward_mode)
+
+        # Initialize recording camera if use_camera_recording
+        self._recording_camera = None
+        if self.use_camera_recording:
+            try:
+                from isaacsim.sensors.camera import Camera
+                from jetbot_config import CAMERA_PRIM_SUFFIX, CAMERA_WIDTH, CAMERA_HEIGHT
+                camera_prim_path = "/World/Jetbot" + CAMERA_PRIM_SUFFIX
+                self._recording_camera = Camera(
+                    prim_path=camera_prim_path,
+                    resolution=(CAMERA_WIDTH, CAMERA_HEIGHT),
+                    name="recording_camera",
+                )
+                self._recording_camera.initialize()
+                # Warm-up frames
+                for _ in range(5):
+                    self.world.step(render=True)
+                print(f"  Recording camera initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+            except Exception as e:
+                print(f"  Warning: Recording camera init failed: {e}")
+                self._recording_camera = None
 
         self.tui.set_last_command("Recording components initialized")
 
@@ -2239,7 +2288,16 @@ class JetbotKeyboardController:
 
         # done = true MDP terminal only (goal/collision/OOB); timeout is truncation
         done = goal_reached or collision or self._is_out_of_bounds(position)
-        self.recorder.record_step(self.current_obs, action, reward, done, cost=cost)
+
+        # Capture camera image for recording
+        _rec_image = None
+        if self._recording_camera is not None:
+            rgba = self._recording_camera.get_rgba()
+            if rgba is not None and rgba.size > 0:
+                _rec_image = rgba[:, :, :3].astype(np.uint8)
+
+        self.recorder.record_step(self.current_obs, action, reward, done, cost=cost,
+                                  image=_rec_image)
 
         # Update state
         self.current_obs = next_obs
@@ -2878,6 +2936,10 @@ def parse_args():
         help='Enable LiDAR observations (34D obs instead of 10D)'
     )
     parser.add_argument(
+        '--use-camera', action='store_true',
+        help='Record 84x84 RGB camera frames in HDF5 for vision-based training'
+    )
+    parser.add_argument(
         '--max-steps', type=int, default=500,
         help='Maximum steps per episode (default: 500)'
     )
@@ -2959,5 +3021,6 @@ if __name__ == "__main__":
         noise_linear=args.noise_linear,
         noise_angular=args.noise_angular,
         lookahead=args.lookahead,
+        use_camera_recording=getattr(args, 'use_camera', False),
     )
     controller.run()

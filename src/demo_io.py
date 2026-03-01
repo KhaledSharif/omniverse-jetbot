@@ -149,7 +149,8 @@ class HDF5DemoWriter:
     ]
 
     def __init__(self, filepath: str, obs_dim: int, action_dim: int,
-                 chunk_rows: int = 256, compression: str = 'lzf'):
+                 chunk_rows: int = 256, compression: str = 'lzf',
+                 image_shape: tuple = None):
         """Open or create an HDF5 demo file for incremental writing.
 
         If the file already exists, it is opened in append mode and cursors
@@ -161,6 +162,8 @@ class HDF5DemoWriter:
             action_dim: Action dimension
             chunk_rows: Chunk size for per-step datasets
             compression: Compression filter ('lzf', 'gzip', or None)
+            image_shape: Optional (H, W, C) shape for camera images. When set,
+                creates a /images dataset with gzip compression for uint8 frames.
         """
         if not HDF5_AVAILABLE:
             raise ImportError("h5py is required for HDF5 demo writing. Install with: pip install h5py")
@@ -168,6 +171,7 @@ class HDF5DemoWriter:
         self.filepath = filepath
         self.obs_dim = obs_dim
         self.action_dim = action_dim
+        self._image_shape = image_shape
 
         existing = os.path.exists(filepath)
         self._h5 = h5py.File(filepath, 'a')
@@ -214,6 +218,19 @@ class HDF5DemoWriter:
                 chunks=(min(chunk_rows, cr),), compression=comp,
             )
 
+        # Optional images dataset for camera recordings
+        if self._image_shape is not None:
+            h, w, c = self._image_shape
+            self._h5.create_dataset(
+                'images',
+                shape=(0, h, w, c),
+                maxshape=(None, h, w, c),
+                dtype=np.uint8,
+                chunks=(min(32, chunk_rows), h, w, c),
+                compression='gzip',
+                compression_opts=4,
+            )
+
     def append_steps(self, observations, actions, rewards, dones, costs):
         """Append new step data to datasets.
 
@@ -242,6 +259,23 @@ class HDF5DemoWriter:
             ds[old_len:old_len + n] = arr
 
         self._step_cursor += n
+
+    def append_images(self, images):
+        """Append camera images to the /images dataset.
+
+        Args:
+            images: array-like (N, H, W, C) uint8
+        """
+        if 'images' not in self._h5:
+            return
+        imgs = np.asarray(images, dtype=np.uint8)
+        n = len(imgs)
+        if n == 0:
+            return
+        ds = self._h5['images']
+        old_len = ds.shape[0]
+        ds.resize(old_len + n, axis=0)
+        ds[old_len:old_len + n] = imgs
 
     def append_episode(self, start: int, length: int, ep_return: float, success: bool):
         """Append one episode metadata row.
@@ -274,6 +308,11 @@ class HDF5DemoWriter:
         """
         for name, _, _, _ in self._STEP_DATASETS:
             ds = self._h5[name]
+            if ds.shape[0] > n_steps:
+                ds.resize(n_steps, axis=0)
+        # Also truncate images if present
+        if 'images' in self._h5:
+            ds = self._h5['images']
             if ds.shape[0] > n_steps:
                 ds.resize(n_steps, axis=0)
         self._step_cursor = n_steps

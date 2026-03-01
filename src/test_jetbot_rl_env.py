@@ -613,6 +613,8 @@ class TestBuildObservation:
             env._current_angular_vel = 0.0
             env.add_prev_action = False
             env._prev_action = np.zeros(2, dtype=np.float32)
+            env.use_camera = False
+            env._camera_features = None
 
             # Mock scene_manager and _get_robot_pose
             env.scene_manager = Mock()
@@ -671,6 +673,8 @@ class TestStep:
             env._current_angular_vel = 0.0
             env.add_prev_action = False
             env._prev_action = np.zeros(2, dtype=np.float32)
+            env.use_camera = False
+            env._camera_features = None
             env._wstep_ms_acc = 0.0
             env._wstep_n = 0
 
@@ -746,6 +750,8 @@ class TestReset:
             env._current_angular_vel = 0.5
             env.add_prev_action = False
             env._prev_action = np.zeros(2, dtype=np.float32)
+            env.use_camera = False
+            env._camera_features = None
 
             env.START_POSITION = np.array([0.0, 0.0, 0.05])
 

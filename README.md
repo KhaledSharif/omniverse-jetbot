@@ -17,6 +17,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 - **Action Chunking**: k-step action chunks reduce compounding errors from single-step BC
 - **Chunk CVAE**: Conditional VAE pretraining handles multimodal demonstrations
 - **Q-Chunking**: Critic evaluates chunk-level Q-values via `ChunkedEnvWrapper`
+- **DINOv2 Vision**: Optional frozen DINOv2 ViT-S/14 camera features (384D) via `--use-camera`
 - **Gymnasium Integration**: Standard RL environment compatible with Stable-Baselines3
 - **LiDAR Sensing**: 24-ray analytical raycasting (180 FOV) for obstacle detection
 - **Solvability Checks**: A* path verification on reset ensures navigable goal placements
@@ -79,6 +80,9 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 
 # With SafeTQC (constrained RL)
 ./run.sh train_sac.py --demos demos/recording.hdf5 --headless --safe
+
+# With DINOv2 camera features (requires demos recorded with --use-camera)
+./run.sh train_sac.py --demos demos/camera_demo.hdf5 --headless --use-camera
 ```
 
 ## Controls
@@ -174,6 +178,9 @@ isaac-sim-jetbot-keyboard/
 
 # Headless TUI (console progress prints only)
 ./run.sh --enable-recording --automatic --num-episodes 200 --headless-tui
+
+# With DINOv2 camera image recording (stores raw 84x84 RGB in HDF5)
+./run.sh --enable-recording --automatic --use-camera --num-episodes 50
 ```
 
 ### Training
@@ -202,6 +209,9 @@ isaac-sim-jetbot-keyboard/
 
 # SafeTQC: constrained RL with cost critic + Lagrange multiplier
 ./run.sh train_sac.py --demos demos/recording.npz --headless --safe
+
+# With DINOv2 camera features (418D obs = 10D state + 384D DINOv2 + 24D LiDAR)
+./run.sh train_sac.py --demos demos/camera_demo.hdf5 --headless --use-camera --timesteps 500000
 
 # SafeTQC with custom cost limit and cost type
 ./run.sh train_sac.py --demos demos/recording.npz --headless --safe \
@@ -234,6 +244,11 @@ Critic: Q(obs_features || z=0, action_chunk) → scalar
 ChunkCVAEFeatureExtractor (dynamic split: state_dim = obs_dim - 24):
   obs → split → [state 0:state_dim]       → symlog → MLP(state_dim→64→32) → 32D ┐
                  [lidar state_dim:obs_dim] → symlog → MLP(24→128→64)       → 64D ├→ concat → 96D + z_pad(8D) = 104D
+
+VisionCVAEFeatureExtractor (when --use-camera, three-way split):
+  obs → split → [state 0:state_dim]                → symlog → MLP(state_dim→64→32) → 32D ┐
+                 [image state_dim:state_dim+384]    →          MLP(384→256→64)      → 64D ├→ concat → 160D + z_pad(8D) = 168D
+                 [lidar obs_dim-24:]                → symlog → MLP(24→128→64)       → 64D ┘
 ```
 
 **Pipeline order:**
@@ -256,6 +271,7 @@ ChunkCVAEFeatureExtractor (dynamic split: state_dim = obs_dim - 24):
 | `--cvae-epochs` | 100 | CVAE pretraining epochs |
 | `--cvae-beta` | 0.1 | CVAE KL weight |
 | `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
+| `--use-camera` | off | Enable DINOv2 camera features (418D obs) |
 | `--demo-ratio` | 0.5 | Fraction of batch from demos |
 | `--log-std-init` | -2.0 | Actor log_std after CVAE pretraining or on `--resume`. -2.0 keeps CVAE/checkpoint value (stability system handles entropy). Pass -0.5 for old behavior of boosting exploration noise. |
 | `--ent-coef-init` | 0.1 | ent_coef set after CVAE pretraining and on `--resume`. CVAE/checkpoint may leave ent_coef near 0 (entropy bonus negligible vs Q-values). Use 0 to disable. |
@@ -308,6 +324,9 @@ The VecNormalize pre-warming step is critical: without it, the BC-learned policy
 
 # Evaluation with cost tracking (for SafeTQC models)
 ./run.sh eval_policy.py models/crossq_jetbot.zip --episodes 100 --safe --cost-type proximity
+
+# Evaluate camera model (auto-detected from obs dim, or explicit --use-camera)
+./run.sh eval_policy.py models/crossq_jetbot_camera.zip --episodes 50
 
 # Override chunk size or inflation radius
 ./run.sh eval_policy.py models/crossq_jetbot.zip --chunk-size 5 --inflation-radius 0.08
@@ -372,6 +391,8 @@ python src/demo_io.py demos/recording.npz
 
 With `--add-prev-action` (36D): inserts `[prev_linear_vel, prev_angular_vel]` at indices [10:12], pushing LiDAR to [12:36].
 
+With `--use-camera` (418D): inserts 384D DINOv2 features between state and LiDAR: `[state(10D), image_features(384D), lidar(24D)]`. Combined with `--add-prev-action`: 420D.
+
 The RL environment (`JetbotNavigationEnv`) always uses 34D ego-centric observations with LiDAR.
 The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 
@@ -420,6 +441,7 @@ CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at UTD=1 via Bat
 | TQC       | 5   | 1        | ~10-12  | ~24 hours           | ~4x     |
 | **CrossQ**| **1** | **1** | **~35-39** | **~7 hours**  | **~13x** |
 | CrossQ    | 1   | 4 (GRU)  | ~17     | ~16 hours           | ~6x     |
+| CrossQ    | 1   | 1 (camera) | ~10-20 | ~14-28 hours     | ~3-6x   |
 
 *Measured on RTX 3090 Ti, chunk_size=5, headless, batch size 256.*
 
@@ -440,6 +462,7 @@ Additional optimizations applied in headless mode:
 - **JetbotNavigationEnv**: Gymnasium-compatible RL environment with A* solvability checks on reset
 - **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking
 - **ChunkCVAEFeatureExtractor**: Dynamic split state/lidar MLPs + z-pad slot for CVAE latent variable (supports 34D and 36D obs)
+- **VisionCVAEFeatureExtractor**: Three-way split (state + DINOv2 image + lidar) for `--use-camera` models (168D output)
 - **DifferentialController**: Converts velocity commands to wheel speeds
 - **SceneManager**: Manages goal markers, obstacles, and scene objects
 - **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations; HDF5 incremental writes by default (with cost data for SafeTQC)
