@@ -7,6 +7,103 @@ import numpy as np
 from demo_io import open_demo
 
 
+# Module-level DINOv2 cache (avoid reloading per call)
+_dinov2_cache = {}
+
+
+def _get_dinov2_model(device=None):
+    """Load and cache a frozen DINOv2 ViT-S/14 model.
+
+    Args:
+        device: torch device (auto-selects CUDA if available)
+
+    Returns:
+        Tuple of (model, device, mean_tensor, std_tensor)
+    """
+    import torch
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    key = str(device)
+    if key not in _dinov2_cache:
+        model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+        model = model.to(device)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        _dinov2_cache[key] = (model, device, mean, std)
+    return _dinov2_cache[key]
+
+
+def encode_images_dinov2(images, batch_size=64, device=None):
+    """Batch-encode uint8 RGB images to DINOv2 feature vectors.
+
+    Args:
+        images: numpy array (N, H, W, 3) uint8
+        batch_size: mini-batch size for GPU inference
+        device: torch device (auto-selects CUDA if available)
+
+    Returns:
+        numpy array (N, 384) float32
+    """
+    import torch
+    from jetbot_config import IMAGE_FEATURE_DIM
+
+    model, dev, mean, std = _get_dinov2_model(device)
+    n = len(images)
+    features = np.zeros((n, IMAGE_FEATURE_DIM), dtype=np.float32)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        # (B, H, W, 3) uint8 -> (B, 3, H, W) float32 [0, 1]
+        batch = torch.from_numpy(images[start:end]).float().permute(0, 3, 1, 2).to(dev) / 255.0
+        batch = (batch - mean) / std
+        with torch.no_grad():
+            out = model(batch)  # (B, 384)
+        features[start:end] = out.cpu().numpy()
+        if n > batch_size and start % (batch_size * 10) == 0:
+            print(f"  DINOv2 encoding: {end}/{n} frames", flush=True)
+
+    print(f"  DINOv2 encoded {n} frames -> ({n}, {IMAGE_FEATURE_DIM})")
+    return features
+
+
+def build_camera_obs(base_obs, image_features):
+    """Insert image features into base observations (before LiDAR).
+
+    Args:
+        base_obs: numpy array (N, 34) or (N, 36) base observations
+        image_features: numpy array (N, 384) DINOv2 features
+
+    Returns:
+        numpy array (N, 418) or (N, 420) with features inserted before last 24D
+    """
+    # Split: state = obs[:, :-24], lidar = obs[:, -24:]
+    state = base_obs[:, :-24]
+    lidar = base_obs[:, -24:]
+    return np.concatenate([state, image_features, lidar], axis=1).astype(np.float32)
+
+
+def load_demo_images(filepath):
+    """Load raw camera images from a demo file.
+
+    Args:
+        filepath: Path to demo file (.hdf5 or .npz)
+
+    Returns:
+        numpy array (N, H, W, 3) uint8, or None if no images stored
+    """
+    data = open_demo(filepath)
+    if 'images' in data:
+        images = data['images']
+        data.close()
+        return images
+    data.close()
+    return None
+
+
 def convert_obs_to_egocentric(obs_array, workspace_bounds):
     """Vectorized conversion from old (v1) 34D obs to new ego-centric (v2) 34D obs.
 
@@ -165,7 +262,8 @@ def load_demo_data(filepath: str, successful_only: bool = False):
     return observations.astype(np.float32), actions.astype(np.float32)
 
 
-def load_demo_transitions(npz_path: str, load_costs: bool = False):
+def load_demo_transitions(npz_path: str, load_costs: bool = False,
+                           load_images: bool = False):
     """Load demo data and reconstruct (obs, action, reward, next_obs, done) tuples.
 
     Uses the recorded ``dones`` from the NPZ file, which mark true MDP terminals
@@ -176,9 +274,14 @@ def load_demo_transitions(npz_path: str, load_costs: bool = False):
     ``goal_reached``, the last step of each episode falls back to ``done=1.0`` if
     no terminal was recorded.
 
+    When ``load_images=True``, loads raw images from the demo file, encodes them
+    via DINOv2, and inserts the 384D features into observations (before LiDAR),
+    producing 418D or 420D observations.
+
     Args:
         npz_path: Path to .npz demo file
         load_costs: If True, also return costs array (6-tuple)
+        load_images: If True, load camera images, encode with DINOv2, and expand obs
 
     Returns:
         5-tuple of (obs, actions, rewards, next_obs, dones) numpy arrays, or
@@ -233,6 +336,19 @@ def load_demo_transitions(npz_path: str, load_costs: bool = False):
         offset += length
 
     print(f"Loaded {len(episode_lengths)} demo episodes, {total} transitions")
+
+    # Expand observations with DINOv2 features if camera images available
+    if load_images:
+        images = load_demo_images(npz_path)
+        if images is not None:
+            print(f"  Encoding {len(images)} camera images with DINOv2...")
+            features = encode_images_dinov2(images)
+            observations = build_camera_obs(observations, features)
+            next_obs = build_camera_obs(next_obs, features)
+            print(f"  Observations expanded: {observations.shape[1]}D (with camera features)")
+        else:
+            print("  Warning: --use-camera but demo has no images, using base obs")
+
     if load_costs:
         costs = data['costs'].astype(np.float32) if 'costs' in data else np.zeros(total, dtype=np.float32)
         return observations, actions, rewards, next_obs, dones, costs

@@ -83,6 +83,8 @@ Examples:
                         help='Cost signal type for evaluation (default: proximity)')
     parser.add_argument('--add-prev-action', action='store_true',
                         help='Include previous action in observations (36D instead of 34D)')
+    parser.add_argument('--use-camera', action='store_true',
+                        help='Enable DINOv2 camera features (auto-detected from model obs dim)')
 
     args = parser.parse_args()
 
@@ -125,10 +127,11 @@ Examples:
     except ImportError:
         TQC = None
 
-    # Create environment
+    # Create environment (use_camera may be overridden by auto-detection after model load)
     print("Creating environment...")
     # Auto-detect add_prev_action from model obs dim if not explicitly set
     add_prev_action = getattr(args, 'add_prev_action', False)
+    use_camera = getattr(args, 'use_camera', False)
 
     raw_env = JetbotNavigationEnv(
         reward_mode=args.reward_mode,
@@ -136,6 +139,7 @@ Examples:
         inflation_radius=args.inflation_radius,
         cost_type=args.cost_type,
         add_prev_action=add_prev_action,
+        use_camera=use_camera,
     )
     print(f"  Observation space: {raw_env.observation_space.shape}")
     print(f"  Action space (inner): {raw_env.action_space.shape}")
@@ -186,14 +190,36 @@ Examples:
         chunk_size = model_action_dim // 2
         print(f"  Auto-detected chunk_size={chunk_size} from model action_dim={model_action_dim}")
 
-    # Auto-detect n_frames from model observation space
+    # Auto-detect camera from model observation space
     model_obs_dim = model.observation_space.shape[0]
+    if not use_camera and (model_obs_dim - 384) in (34, 36):
+        use_camera = True
+        print(f"  Auto-detected use_camera=True from model obs_dim={model_obs_dim} "
+              f"(base={model_obs_dim - 384}D + 384D DINOv2)")
+        # Recreate env with camera enabled
+        raw_env.close()
+        raw_env = JetbotNavigationEnv(
+            reward_mode=args.reward_mode,
+            headless=args.headless,
+            inflation_radius=args.inflation_radius,
+            cost_type=args.cost_type,
+            add_prev_action=add_prev_action,
+            use_camera=True,
+        )
+        vec_env = DummyVecEnv([lambda: raw_env])
+        print(f"  Recreated env with camera: obs_space={raw_env.observation_space.shape}")
+
+    # Auto-detect n_frames from model observation space
     n_frames = args.n_frames
     if n_frames is None and model_obs_dim > 34:
-        # base_obs_dim is 34 (standard) or 36 (with prev-action)
-        base_obs_dim = 36 if (model_obs_dim % 36 == 0 and model_obs_dim % 34 != 0) else 34
-        n_frames = model_obs_dim // base_obs_dim
-        print(f"  Auto-detected n_frames={n_frames} from model obs_dim={model_obs_dim} (base={base_obs_dim})")
+        # base_obs_dim depends on camera
+        if use_camera:
+            base_obs_dim = model_obs_dim  # camera models don't use frame stacking yet
+            n_frames = 1
+        else:
+            base_obs_dim = 36 if (model_obs_dim % 36 == 0 and model_obs_dim % 34 != 0) else 34
+            n_frames = model_obs_dim // base_obs_dim
+            print(f"  Auto-detected n_frames={n_frames} from model obs_dim={model_obs_dim} (base={base_obs_dim})")
 
     # Wrap env with FrameStackWrapper if frame-stacked model
     if n_frames is not None and n_frames > 1:
